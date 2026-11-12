@@ -326,7 +326,9 @@ if os.environ.get("BR_QUICK_CHECK", "on").lower() != "off":
 # Change Airtable table / field names and the match threshold here.
 # ---------------------------------------------------------------- config
 # Settings. Values in os.environ come from Render -> Environment; the rest are fixed IDs / names.
-AIRTABLE_TOKEN = os.environ["AIRTABLE_TOKEN"]
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
+if not AIRTABLE_TOKEN:                 # was a crash at start (test site 2026-11-12) -> now only Airtable READS fail
+    print("[CONFIG] AIRTABLE_TOKEN not set in Render -> Load from Airtable / Airtable reads will not work", flush=True)
 RUN_SECRET = os.environ.get("RUN_SECRET", "")
 BASE_ID = "app5gOqDt9aZrW5bV"
 FI_TABLE = "tblL03CEHdYy1kUdQ"      # French Inventories
@@ -2976,10 +2978,15 @@ def our_stock_numbers():
     """Stock NUMBER of every SKU on fragrantsouq.com: Shopify ADMIN API (the public list only says in / out of stock).
     Uses Render env SHOPIFY_SHOP + SHOPIFY_API_TOKEN (same as 'Create in website'). Returns {SKU: qty} ({} when the
     token is missing or Shopify refuses - the page then simply shows no stock number)."""
-    shop, token = os.environ.get("SHOPIFY_SHOP", ""), os.environ.get("SHOPIFY_API_TOKEN", "")
-    ver = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
-    if not shop or not token:
-        log("[OUR-QTY] SHOPIFY_SHOP / SHOPIFY_API_TOKEN not set -> no stock numbers")
+    import shopify_create as sc                          # fixed token, or client id + secret (Dev Dashboard app)
+    shop, ver = sc.SHOP, sc.API_VERSION
+    if not shop or not sc.TOKEN:
+        log("[OUR-QTY] SHOPIFY_SHOP / SHOPIFY_API_TOKEN (or SHOPIFY_CLIENT_ID + SECRET) not set -> no stock numbers")
+        return {}
+    try:
+        token = sc.access_token()
+    except Exception as ex:
+        log(f"[OUR-QTY] no Shopify token: {ex} -> no stock numbers")
         return {}
     url = f"https://{shop}/admin/api/{ver}/products.json"
     params = {"limit": 250, "fields": "id,variants"}

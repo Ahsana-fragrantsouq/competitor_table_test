@@ -68,7 +68,14 @@ except ImportError as _ex:
 #       schtasks /Change /TN "Competitor daily update" /ST 10:00
 #   (or Task Scheduler -> Competitor daily update -> Triggers -> Edit -> Start time).
 #   The time written on the website is only text: competitors_page.py, search for "START TIME".
-SITE = os.environ.get("CT_SITE", "https://competitor-table.onrender.com")   # Render app
+# The website's own address (Run 2 / Manual sync call its download routes). On Render: THIS website itself
+# (RENDER_EXTERNAL_URL, set by Render) -> the TEST site never starts downloads on production (2026-11-12).
+# On the PC (no RENDER_EXTERNAL_URL): production, unless CT_SITE says otherwise.
+PRODUCTION_SITE = "https://competitor-table.onrender.com"
+SITE = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("CT_SITE") or PRODUCTION_SITE).rstrip("/")
+TEST_SITE = os.environ.get("TEST_SITE", "off").lower() in ("on", "1", "true", "yes")
+if TEST_SITE and SITE == PRODUCTION_SITE:      # test website must never call production -> refuse (render_get)
+    print(f"[TEST-SITE] SITE = {SITE} = PRODUCTION -> calls to the website are BLOCKED on the test site", flush=True)
 CDP_URL = "http://localhost:9222"                                           # your Chrome (remote debugging)
 CHROME_EXE = os.environ.get("CHROME_EXE", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 CHROME_PROFILE = os.environ.get("CHROME_PROFILE", r"C:\ff-scraper\chrome-profile")
@@ -541,6 +548,9 @@ def render_get(path, tries=6):
     secret = os.environ.get("RUN_SECRET", "")
     if not secret:
         log(f"[RENDER] RUN_SECRET not set -> cannot open {path}")
+        return None
+    if TEST_SITE and SITE == PRODUCTION_SITE:
+        log(f"[TEST-SITE] {path} NOT opened: the test site would call PRODUCTION ({SITE})")
         return None
     for attempt in range(1, tries + 1):
         try:
