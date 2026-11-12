@@ -1,0 +1,364 @@
+"""
+"Create a new item"  (ADMIN ONLY - menu Item Master -> Create a new item -> /item-master/new)
+=============================================================================================
+Same fields as the Airtable form "New Perfume Entry", WITHOUT the prices, + Product type:
+  Brand (required, pick one or "+ Add brand") · Perfume Name (required) · Size · Type · Category · Product type · Barcode
+Saved straight into OUR database - NOT in Airtable - in BOTH tables (one transaction):
+  item_master (Item Master page) + competitor_table (Competitor table page; next match runs find its prices).
+  Not in Airtable -> every Airtable write skips it (app.py in_airtable()); its prices stay in our database.
+Made automatically on Submit (like Airtable did) - NOT shown on the form:
+  * SKU          = the brand's SKU Prefix + Next SKU number (table brand_sku, Settings -> Automate), then that
+                   brand's Next SKU number + 1. e.g. Afnan AFN 1057 -> SKU AFN1057, Afnan's next = 1058.
+                   Brand without a prefix (e.g. added with "+ Add brand") -> saved without SKU.
+  * Product Name = Brand + Perfume Name + Size (no space) + Type + Category (capital) + Product type
+                   e.g. "Abdul Samad Al Qurashi Amber touch 30 ml EDP Unisex Spray"
+The new row: id "new" + 14 letters/digits (Airtable ids start with "rec"), source = 'website'
+-> "Load from Airtable now" never deletes or changes it. After saving, the Item Master shows it and
+"Create product description" / "Create in website" work for it like for every other product.
+
+Where things are (change them here):
+  SECTION 1  settings      -> SELECT_COLS (dropdown boxes)
+  SECTION 2  page HTML     -> NEW_HTML (the form; product name is NOT shown, made on Submit)
+  SECTION 3  database      -> choices(), product_name(), take_sku(), clean_form(), save_item()
+  SECTION 4  routes        -> GET / POST /item-master/new
+  SECTION 5  hooks         -> init(connect)
+"""
+
+import re
+from urllib.parse import urlencode
+import secrets
+import string
+
+import psycopg2.extras
+from flask import Blueprint, request, render_template_string, redirect, g
+
+import competitors_page                     # menu bar (render_nav, NAV_CSS) + menu counts
+import item_master                          # IM_CREATE (table + columns)
+import brand_sku                            # SKU Prefix + Next SKU number per brand (brand_sku.py)
+from auth import is_admin
+
+new_item_bp = Blueprint("item_create", __name__)
+
+
+def log(*a):
+    """Print to the Render log (lines start with [NEW-ITEM])."""
+    print(*a, flush=True)
+
+
+# ============================================================ SECTION 1: settings
+# dropdown boxes: (item_master column, label). Their choices = the values already used in Item Master.
+SELECT_COLS = [("size", "Size"), ("type", "Type"), ("category", "Category"), ("product_type", "Product type")]
+SOURCE_SQL = "ALTER TABLE item_master ADD COLUMN IF NOT EXISTS source TEXT;"   # 'website' = made by this form
+
+
+# ============================================================ SECTION 2: page HTML
+NEW_HTML = """<!doctype html><html><head><title>Create a new item - Item Master</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ :root{--bg:#1c1b19;--card:#252420;--line:#3a3833;--text:#f2efe9;--muted:#a9a397;--gold:#d8b76e}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--text);font-family:Roboto,-apple-system,Segoe UI,Arial,sans-serif}
+ .page{max-width:920px;margin:0 auto;padding:22px 18px 40px}
+ h1{font-size:26px;margin:4px 0 18px}
+ .topbar{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+ .who{color:var(--muted);font-size:14px} .who b{color:var(--text)} .who a{color:var(--gold)}
+ {{ nav_css|safe }}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;margin-top:14px}
+ .card h2{font-size:24px;margin:0 0 4px}
+ .sub{color:var(--muted);font-size:14px;margin:0 0 16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+ .err{background:rgba(224,128,108,.12);border:1px solid #e0806c;color:#e0806c;border-radius:12px;padding:12px 14px;margin:0 0 14px}
+ .err ul{margin:4px 0 0 18px;padding:0}
+ .f{margin-bottom:14px}
+ label{display:flex;justify-content:space-between;font-weight:600;font-size:14px;margin-bottom:6px}
+ label .req{color:#e0806c}
+ input,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;
+              padding:10px 12px;font-size:15px;font-family:inherit}
+ input:focus,select:focus{outline:2px solid var(--gold);outline-offset:1px}
+ .addbrand{background:none;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:6px 12px;
+           font-size:13px;cursor:pointer;margin-top:8px}
+ .newbrand{margin-top:8px}
+ .newbrand[hidden]{display:none}
+ .small{color:var(--muted);font-size:12px;margin-top:4px}
+ .actions{display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);padding-top:14px}
+ .clear{background:none;border:0;color:var(--gold);font-size:14px;cursor:pointer}
+ .save{background:#f2d675;color:#1c1b19;border:0;border-radius:10px;padding:11px 22px;font-size:15px;font-weight:700;cursor:pointer}
+ .noadmin{background:var(--card);border:1px dashed var(--line);border-radius:16px;padding:28px 20px;text-align:center;color:var(--muted)}
+</style></head><body><div class="page">
+<div class="topbar"><h1>Create a new item</h1>
+  {% if g.user %}<span class="who">Logged in as <b>{{ g.user }}</b> · <a href="/logout">Log out</a></span>{% endif %}</div>
+{{ nav_html|safe }}
+{% if not admin %}
+<div class="noadmin">Only admins can create new items.</div>
+{% else %}
+<form class="card" id="newform" method="post" action="/item-master/new" autocomplete="off">
+  <h2>New Perfume Entry</h2>
+  <div class="sub">For adding a new perfume to the Item Master (our database - not Airtable).</div>
+  {% if errors %}<div class="err">Not saved:<ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
+
+  <div class="f"><label for="f-brand">Brand <span class="req">*</span></label>
+    <select id="f-brand" name="brand">
+      <option value="">- choose a brand -</option>
+      {% for b in brands %}<option value="{{ b }}" {% if v.brand == b %}selected{% endif %}>{{ b }}</option>{% endfor %}
+    </select>
+    <button type="button" class="addbrand" id="addbrand">+ Add brand</button>
+    <div class="newbrand" id="newbrand" {% if not v.new_brand %}hidden{% endif %}>
+      <input name="new_brand" id="f-newbrand" placeholder="New brand name" value="{{ v.new_brand or '' }}">
+    </div>
+  </div>
+
+  <div class="f"><label for="f-perfume">Perfume Name <span class="req">*</span></label>
+    <input id="f-perfume" name="perfume_name" value="{{ v.perfume_name or '' }}"></div>
+
+  {% for col, label in selects %}
+  <div class="f"><label for="f-{{ col }}">{{ label }}</label>
+    <select id="f-{{ col }}" name="{{ col }}">
+      <option value=""></option>
+      {% for c in choices[col] %}<option value="{{ c }}" {% if v[col] == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+    </select></div>
+  {% endfor %}
+
+  <div class="f"><label for="f-barcode">Barcode</label>
+    <input id="f-barcode" name="barcode" inputmode="numeric" placeholder="8-14 digits" value="{{ v.barcode or '' }}"></div>
+
+
+  <div class="actions">
+    <button type="button" class="clear" id="clearform">&#8634; Clear form</button>
+    <button type="submit" class="save">Submit</button>
+  </div>
+</form>
+<script>
+  // ---- Create a new item: "+ Add brand" switch + Clear form (product name is made on Submit) ----
+  function el(id) { return document.getElementById(id); }
+  el("addbrand").addEventListener("click", function () {
+    var nb = el("newbrand"); nb.hidden = !nb.hidden;
+    el("f-brand").disabled = !nb.hidden;
+    el("addbrand").textContent = nb.hidden ? "+ Add brand" : "Choose an existing brand instead";
+    if (!nb.hidden) el("f-newbrand").focus(); else el("f-newbrand").value = "";
+    console.log("[NEW-ITEM] " + (nb.hidden ? "existing brand" : "adding a new brand"));
+  });
+  el("clearform").addEventListener("click", function () {
+    if (!confirm("Clear the whole form?")) return;
+    el("newform").querySelectorAll("input").forEach(function (i) { i.value = ""; });
+    el("newform").querySelectorAll("select").forEach(function (s) { s.selectedIndex = 0; });
+    if (!el("newbrand").hidden) el("addbrand").click();
+    console.log("[NEW-ITEM] form cleared");
+  });
+  if (!el("newbrand").hidden) { el("f-brand").disabled = true; el("addbrand").textContent = "Choose an existing brand instead"; }
+</script>
+{% endif %}
+</div></body></html>"""
+
+
+# ============================================================ SECTION 3: database
+_hooks = {}
+_ready = False
+
+
+def _conn():
+    """Database connection; item_master + its columns (+ source) exist (once after each start)."""
+    global _ready
+    conn = _hooks["connect"]()
+    if not _ready:
+        cur = conn.cursor()
+        cur.execute(item_master.IM_CREATE)
+        cur.execute(SOURCE_SQL)
+        cur.execute(brand_sku.BRAND_SKU_CREATE)          # SKU prefixes table (brand_sku.py)
+        # items made here BEFORE they were also saved in competitor_table -> copy them in once
+        cur.execute("SELECT to_regclass('competitor_table') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute(f"""INSERT INTO competitor_table ({CT_COLS})
+                            SELECT fi_record_id, {CT_CODE_SQL}, sku, product_name, brand, barcode, perfume_name
+                            FROM item_master im WHERE source = 'website'
+                              AND NOT EXISTS (SELECT 1 FROM competitor_table c WHERE c.fi_record_id = im.fi_record_id)""")
+            if cur.rowcount:
+                log(f"[NEW-ITEM] {cur.rowcount} item(s) made earlier on the website copied into competitor_table")
+        conn.commit()
+        _ready = True
+    return conn
+
+
+# the same product also goes into competitor_table (the Competitor table page) - same database, its own table.
+# french_inventory_code = "SKU/Product name" like Airtable's Item ID (e.g. "AFN1057/Afnan 9 PM 100 ml ...")
+CT_COLS = "fi_record_id, french_inventory_code, sku, product_name, brand, barcode, perfume_name"
+CT_CODE_SQL = "CASE WHEN COALESCE(sku, '') <> '' THEN sku || '/' || product_name ELSE product_name END"
+
+
+def add_to_competitor_table(cur, fid):
+    """Copy the new item_master row into competitor_table (same transaction as the item). Next match runs then
+    find its competitor prices like for every other product. Prices go to OUR database only (not in Airtable)."""
+    cur.execute("SELECT to_regclass('competitor_table') IS NOT NULL")
+    if not cur.fetchone()[0]:
+        log("[NEW-ITEM] competitor_table does not exist yet -> not added there")
+        return 0
+    cur.execute(f"""INSERT INTO competitor_table ({CT_COLS})
+                    SELECT fi_record_id, {CT_CODE_SQL}, sku, product_name, brand, barcode, perfume_name
+                    FROM item_master WHERE fi_record_id = %s
+                    ON CONFLICT (fi_record_id) DO NOTHING""", (fid,))
+    return cur.rowcount
+
+
+def choices(cur):
+    """Brands + values already used for each dropdown box (like Airtable's single-select options)."""
+    out = {}
+    for col in ["brand"] + [c for c, _ in SELECT_COLS]:
+        cur.execute(f"SELECT DISTINCT {col} FROM item_master WHERE COALESCE({col}, '') <> '' ORDER BY {col}")
+        out[col] = [r[0] for r in cur.fetchall()]
+    # brands made with Item Master -> Brands -> Create new have no products yet -> add every brand of brand_sku
+    cur.execute("SELECT to_regclass('brand_sku') IS NOT NULL")
+    if cur.fetchone()[0]:
+        cur.execute("SELECT brand FROM brand_sku WHERE COALESCE(TRIM(brand), '') <> ''")
+        have = {b.lower() for b in out["brand"]}
+        out["brand"] = sorted(out["brand"] + [b for (b,) in cur.fetchall() if b.lower() not in have], key=str.lower)
+    return out
+
+
+def product_name(v):
+    """Brand + Perfume Name + Size + Type + Category + Product type (empty ones left out), e.g.
+    'Mercedes Benz Man Fresh 100 ml EDT Men Perfume': size WITH a space before the unit ('100ml' -> '100 ml',
+    user 2026-11-09: "i want like 100 ml but when i edit 30 ml it saved as 30ml"; was: space removed),
+    category with a capital first letter ('men' -> 'Men'). Used by Create a new item AND Item Master Edit."""
+    size = re.sub(r"\s+", " ", (v.get("size") or "").strip())
+    size = re.sub(r"(\d)\s*([A-Za-z]+)$", r"\1 \2", size)                # "100ml" / "100 ml" -> "100 ml"
+    cat = (v.get("category") or "").strip()
+    cat = cat[:1].upper() + cat[1:]                                     # "men" -> "Men"
+    return " ".join(x.strip() for x in [v.get("brand"), v.get("perfume_name"), size, v.get("type"), cat,
+                                        v.get("product_type")] if x and x.strip())
+
+
+def take_sku(cur, brand):
+    """SKU for a new product of this brand = SKU prefix + Next SKU number from brand_sku (brand_sku.py),
+    then Next SKU number + 1 in brand_sku. e.g. Afnan: AFN + 1057 -> SKU AFN1057, Afnan's next becomes 1058.
+    The brand row is LOCKED (FOR UPDATE) until the caller commits -> two people saving at the same time never
+    get the same SKU. A number already used in Item Master is skipped. Returns (sku, None) or (None, reason)."""
+    cur.execute("SELECT brand, sku_prefix, next_sku_number FROM brand_sku WHERE LOWER(brand) = LOWER(%s) FOR UPDATE",
+                (brand,))
+    row = cur.fetchone()
+    if not row:
+        return None, f"brand '{brand}' is not in the brand table (Item Master -> Brands -> Create new)"
+    _, prefix, nxt = row
+    if not prefix:
+        return None, f"brand '{brand}' has no SKU Prefix"
+    if nxt is None:                                      # prefix but no number yet -> start at 1001 (database default)
+        log(f"[NEW-ITEM] brand '{brand}' has no Next SKU number -> starting at {brand_sku.FIRST_SKU_NUMBER}")
+    n = int(nxt if nxt is not None else brand_sku.FIRST_SKU_NUMBER)
+    while True:                                          # never give a SKU that is already used
+        cur.execute("SELECT 1 FROM item_master WHERE UPPER(TRIM(sku)) = %s LIMIT 1", (f"{prefix}{n}".upper(),))
+        if not cur.fetchone():
+            break
+        log(f"[NEW-ITEM] SKU {prefix}{n} is already used -> trying {prefix}{n + 1}")
+        n += 1
+    cur.execute("UPDATE brand_sku SET next_sku_number = %s, updated_at = NOW() WHERE LOWER(brand) = LOWER(%s)",
+                (n + 1, brand))
+    log(f"[NEW-ITEM] SKU {prefix}{n} for brand '{brand}' -> its Next SKU number is now {n + 1}")
+    return f"{prefix}{n}", None
+
+
+def new_id():
+    """Id for a product made here: 'new' + 14 letters/digits (17 long, like Airtable's 'rec...' ids)."""
+    return "new" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(14))
+
+
+def clean_form(form, opts):
+    """Form -> (values, problems). Brand: an existing one, or a new one typed after '+ Add brand'."""
+    v = {k: (form.get(k) or "").strip() for k in
+         ["brand", "new_brand", "perfume_name", "barcode"] + [c for c, _ in SELECT_COLS]}
+    errors = []
+    if v["new_brand"]:
+        same = next((b for b in opts["brand"] if b.lower() == v["new_brand"].lower()), None)
+        if same:
+            errors.append(f"Brand '{same}' already exists - choose it from the list")
+        v["brand"] = v["new_brand"]
+    elif not v["brand"]:
+        errors.append("Brand is required")
+    if not v["perfume_name"]:
+        errors.append("Perfume Name is required")
+    if v["barcode"] and not re.fullmatch(r"\d{8,14}", v["barcode"]):
+        errors.append("Barcode must be 8 to 14 digits")
+    for col, label in SELECT_COLS:                       # only the offered choices (like an Airtable single select)
+        if v[col] and v[col] not in opts[col]:
+            errors.append(f"{label}: '{v[col]}' is not one of the choices")
+    return v, errors
+
+
+def save_item(v, user):
+    """Make the product name + SKU (take_sku), check the barcode is not used yet, insert - ONE transaction:
+    the new product and the brand's new Next SKU number are saved together or not at all.
+    Returns (new id, product name, sku or None, None) or (None, None, None, problem)."""
+    conn = _conn()
+    try:
+        cur = conn.cursor()
+        if v["barcode"]:
+            cur.execute("SELECT sku, product_name FROM item_master WHERE barcode = %s LIMIT 1", (v["barcode"],))
+            same = cur.fetchone()
+            if same:
+                return None, None, None, f"Barcode {v['barcode']} is already used by " + " ".join(
+                    x for x in [same[0], f"'{same[1]}'"] if x)
+        name = product_name(v)
+        sku, why = take_sku(cur, v["brand"])
+        if not sku:                                      # e.g. a brand added with "+ Add brand": no prefix yet
+            log(f"[NEW-ITEM] No SKU for '{name}': {why} -> saved without SKU")
+        fid = new_id()
+        cur.execute("""INSERT INTO item_master (fi_record_id, source, loaded_at, sku, brand, perfume_name, size, type,
+                                                category, product_type, barcode, product_name)
+                       VALUES (%s, 'website', NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (fid, sku, v["brand"], v["perfume_name"], v["size"] or None, v["type"] or None,
+                     v["category"] or None, v["product_type"] or None, v["barcode"] or None, name))
+        in_ct = add_to_competitor_table(cur, fid)        # also on the Competitor table page
+        conn.commit()                                    # product (both tables) + brand's Next SKU number together
+        log(f"[NEW-ITEM] {fid}: saved in item_master" + (" + competitor_table" if in_ct else ""))
+        log(f"[NEW-ITEM] {user} created {sku or '(no SKU)'} '{name}' -> item_master {fid}")
+        return fid, name, sku, None
+    except Exception:
+        conn.rollback()                                  # nothing half-saved
+        raise
+    finally:
+        conn.close()
+
+
+# ============================================================ SECTION 4: routes
+def _page(v=None, errors=None, status=200):
+    conn = _conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        counts = competitors_page.tab_counts(cur)
+        plain = conn.cursor()
+        opts = choices(plain) if is_admin() else {}
+    finally:
+        conn.close()
+    return render_template_string(NEW_HTML, nav_html=competitors_page.render_nav("item", "im-new", counts),
+                                  nav_css=competitors_page.NAV_CSS, admin=is_admin(), v=v or {}, errors=errors or [],
+                                  brands=opts.get("brand", []), choices=opts, selects=SELECT_COLS), status
+
+
+@new_item_bp.route("/item-master/new", methods=["GET", "POST"])
+def new_item():
+    """GET = empty form. POST = check + save -> Item Master showing the new item."""
+    if request.method == "GET":
+        log(f"[NEW-ITEM] Form opened by {g.get('user')}")
+        return _page()
+    if not is_admin():
+        log(f"[NEW-ITEM] Refused: {g.get('user')} is not an admin")
+        return _page(errors=["Only admins can create new items"], status=403)
+    conn = _conn()
+    try:
+        cur = conn.cursor()
+        opts = choices(cur)
+    finally:
+        conn.close()
+    v, errors = clean_form(request.form, opts)
+    if not errors:
+        fid, name, sku, problem = save_item(v, g.get("user"))
+        if problem:
+            errors.append(problem)
+    if errors:
+        log(f"[NEW-ITEM] Not saved for {g.get('user')}: {errors}")
+        return _page(v, errors, status=400)
+    msg = f"New item {sku} created: {name}" if sku else f"New item created (no SKU - brand has no SKU prefix): {name}"
+    return redirect("/item-master?" + urlencode({"q": sku or fid, "msg": msg}))
+
+
+# ============================================================ SECTION 5: hooks (called once from app.py)
+def init(connect):
+    """connect() -> new Postgres connection (app.pg_conn)."""
+    _hooks["connect"] = connect
+    log("[NEW-ITEM] Linked to app.py: Item Master -> Create a new item (/item-master/new, saved in item_master)")
