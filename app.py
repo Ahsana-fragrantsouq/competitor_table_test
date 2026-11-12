@@ -272,14 +272,22 @@ init_auth(app)                                     # users from Render env var U
 #   - Run 2 + Brands Perfume quick check are OFF unless RUN2_SCHEDULER=on / BR_QUICK_CHECK=on is set
 #   - a red "TEST SITE" bar on every page (test_banner, after_request) so nobody mixes the two sites up
 TEST_SITE = os.environ.get("TEST_SITE", "off").lower() in ("on", "1", "true", "yes")
+# the REAL database name = last part of FF_DATABASE_URL (shown in the log + red bar; never the password)
+DB_NAME = (os.environ.get("FF_DATABASE_URL") or "").partition("?")[0].rpartition("/")[2] or "(FF_DATABASE_URL not set)"
+DB_IS_PRODUCTION = DB_NAME == "french_fragrance_db"
 if TEST_SITE:
-    print(f"[TEST-SITE] ON: Airtable writes OFF, Shopify store = {os.environ.get('SHOPIFY_SHOP') or '(SHOPIFY_SHOP not set!)'}",
-          flush=True)
+    print(f"[TEST-SITE] ON: Airtable writes OFF, Shopify store = {os.environ.get('SHOPIFY_SHOP') or '(SHOPIFY_SHOP not set!)'}"
+          f", database = {DB_NAME}", flush=True)
+    if DB_IS_PRODUCTION:
+        print("[TEST-SITE] !!! WARNING: the TEST site uses the PRODUCTION database french_fragrance_db - change "
+              "FF_DATABASE_URL to .../french_fragrance_test in Render !!!", flush=True)
     os.environ.setdefault("RUN2_SCHEDULER", "off")
     os.environ.setdefault("BR_QUICK_CHECK", "off")
 TEST_BAR = ('<div style="position:sticky;top:0;z-index:9999;background:#b3261e;color:#fff;text-align:center;'
             'font:600 14px sans-serif;padding:6px">TEST SITE &middot; Shopify: '
-            + (os.environ.get("SHOPIFY_SHOP") or "not set") + ' &middot; Airtable not changed</div>')
+            + (os.environ.get("SHOPIFY_SHOP") or "not set") + ' &middot; Database: ' + DB_NAME
+            + (' &mdash; WARNING: this is the PRODUCTION database!' if DB_IS_PRODUCTION else '')
+            + ' &middot; Airtable not changed</div>')
 
 
 @app.after_request
@@ -1315,7 +1323,7 @@ def pg_conn():
     url = os.environ.get("FF_DATABASE_URL")
     if not url:
         raise RuntimeError("FF_DATABASE_URL is not set")
-    log("[PG] Opening connection to french_fragrance_db")
+    log(f"[PG] Opening connection to {DB_NAME}")              # real name from FF_DATABASE_URL
     return psycopg2.connect(url, sslmode="require")
 
 
