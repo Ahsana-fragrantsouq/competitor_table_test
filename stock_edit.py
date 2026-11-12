@@ -19,6 +19,8 @@ Where things are (change them here):
   SECTION 5  hooks         -> init(): database connection from app.py
 """
 
+import psycopg2
+import psycopg2.errors
 from flask import Blueprint, request, jsonify, g
 
 from auth import is_admin
@@ -34,6 +36,7 @@ def log(*a):
 # ============================================================ SECTION 1: settings
 SAVE_URL = "/stock/edit"
 MAX_QTY = 100000                    # bigger numbers are refused (typing mistake)
+LOCK_WAIT = "8s"                    # our rows busy longer than this (Refresh / price update running) -> "try again"
 
 
 # ============================================================ SECTION 2: card parts (competitors_page.py + item_master.py put them in)
@@ -172,11 +175,25 @@ def stock_save():
         if not sku:
             return jsonify({"ok": False, "error": "product has no SKU"}), 400
         log(f"[STOCK-EDIT] {g.get('user')} -> {fid} ({sku}): stock {old} -> {qty}")
+        # Our rows FIRST, before Shopify (2026-11-12, test site: Save during a Brands Refresh waited on the busy rows
+        # until the worker was killed -> Shopify changed, our table not). Rows busy for > LOCK_WAIT -> nothing is
+        # changed anywhere and the card says "busy, try again". The rows stay ours until the commit below.
+        try:
+            cur.execute(f"SET LOCAL lock_timeout = '{LOCK_WAIT}'")
+            cur.execute("SELECT 1 FROM competitor_table WHERE fi_record_id = %s FOR UPDATE", (fid,))
+            if has_im:
+                cur.execute("SELECT 1 FROM item_master WHERE fi_record_id = %s FOR UPDATE", (fid,))
+        except psycopg2.errors.LockNotAvailable:
+            conn.rollback()
+            log(f"[STOCK-EDIT] {fid}: rows busy (refresh / price update running) -> nothing changed")
+            return jsonify({"ok": False, "error": "The table is busy (a refresh or price update is running) - "
+                                                   "nothing was changed, try again in a minute"}), 409
         try:
             ok, info = shopify_set_stock(sku, shopify_id, qty)
         except Exception as ex:
             ok, info = False, f"Shopify error: {str(ex)[:150]}"
         if not ok:
+            conn.rollback()                          # lets the rows go again
             log(f"[STOCK-EDIT] {fid}: NOT updated - {info}")
             return jsonify({"ok": False, "error": info}), 502
         cur.execute("UPDATE competitor_table SET our_stock_qty = %s, our_stock = %s, updated_at = NOW() "
