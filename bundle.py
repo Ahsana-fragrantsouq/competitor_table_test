@@ -525,6 +525,10 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
  .price{font-size:22px;font-weight:700;color:var(--yellow);text-align:right}
  .price small{display:block;font-size:13px;font-weight:400;color:var(--muted)}
  .sku{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:var(--muted);word-break:break-all}
+ .foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+ .rm{background:none;border:1px solid #e0806c;color:#e0806c;border-radius:10px;padding:7px 14px;cursor:pointer;font-size:14px}
+ .rm:hover{background:rgba(224,128,108,.12)} .rm:disabled{opacity:.5;cursor:default}
+ .rmmsg{font-size:13px;margin-top:6px}
 </style></head><body><div class="page">
 <div class="topbar"><h1>Bundles</h1>
   {% if g.user %}<span class="who">Logged in as <b>{{ g.user }}</b> · <a href="/logout">Log out</a></span>{% endif %}</div>
@@ -534,9 +538,9 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
   <button class="btn" type="submit">Go</button>
   {% if admin %}<a class="ghost" href="/bundle/new" style="text-decoration:none">+ Create bundle</a>{% endif %}
 </form>
-<p class="muted" style="font-size:14px">{{ rows|length }} bundle{{ '' if rows|length == 1 else 's' }}{% if q %} matching "{{ q }}"{% endif %}.</p>
+<p class="muted" style="font-size:14px" id="bcount">{{ rows|length }} bundle{{ '' if rows|length == 1 else 's' }}{% if q %} matching "{{ q }}"{% endif %}.</p>
 {% for b in rows %}
-<div class="card bcard">
+<div class="card bcard" id="bundle-{{ b.id }}">
   <div class="top">
     <div style="flex:1;min-width:0">
       <h2>{{ b.title }}</h2>
@@ -550,11 +554,37 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
     {% for it in b['items'] %}<li><span>{{ it.qty }} x {{ it.name }} <span class="sku">({{ it.sku }})</span></span>
       <span class="muted">AED {{ '%.2f' % (it.price * it.qty) }}</span></li>{% endfor %}
   </ul>
-  <p class="muted" style="font-size:13px;margin:8px 0 0">Added by {{ b.created_by or '-' }} on {{ b.created_at.strftime('%d %b %Y, %H:%M') }}</p>
+  <div class="foot">
+    <p class="muted" style="font-size:13px;margin:0">Added by {{ b.created_by or '-' }} on {{ b.created_at.strftime('%d %b %Y, %H:%M') }}</p>
+    {# Remove (admins, 2026-11-13): confirm box -> POST /bundle/delete -> card disappears #}
+    {% if admin %}<button type="button" class="rm" data-id="{{ b.id }}" data-title="{{ b.title }}" onclick="removeBundle(this)">Remove</button>{% endif %}
+  </div>
+  <div class="rmmsg err" id="rmmsg-{{ b.id }}"></div>
 </div>
 {% else %}
 <div class="card"><p class="sub" style="margin:0">No bundles yet.{% if admin %} <a href="/bundle/new" style="color:var(--gold)">Create the first one</a>.{% endif %}</p></div>
 {% endfor %}
+<script>
+  // ---- Remove a bundle (admins): our database only (bundles are not in Shopify) ----
+  async function removeBundle(btn) {
+    var id = btn.dataset.id, msg = document.getElementById("rmmsg-" + id);
+    if (!confirm("Remove this bundle?\n\n" + btn.dataset.title + "\n\nIt is deleted from our list (nothing changes in Shopify).")) return;
+    btn.disabled = true; btn.textContent = "Removing ...";
+    try {
+      var r = await fetch("/bundle/delete", {method: "POST", headers: {"Content-Type": "application/json"},
+                                             body: JSON.stringify({id: parseInt(id, 10)})});
+      var d = await r.json().catch(function () { return {ok: false, error: "HTTP " + r.status}; });
+      if (!d.ok) throw new Error(d.error || ("HTTP " + r.status));
+      document.getElementById("bundle-" + id).remove();
+      var c = document.getElementById("bcount"), n = document.querySelectorAll(".bcard").length;
+      if (c) c.textContent = n + " bundle" + (n === 1 ? "" : "s") + ".";
+      console.log("[BUNDLE] removed #" + id);
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Remove"; msg.textContent = "Not removed: " + e.message;
+      console.log("[BUNDLE] remove #" + id + " failed: " + e.message);
+    }
+  }
+</script>
 </div></body></html>
 """
 
@@ -608,6 +638,33 @@ def bundle_list():
     nav_html, nav_css = _nav("bundle-list")
     log(f"[BUNDLE] list: {len(rows)} bundles{f' for {q!r}' if q else ''}")
     return render_template_string(LIST_HTML, nav_html=nav_html, nav_css=nav_css, rows=rows, q=q, admin=is_admin())
+
+
+@bundle_bp.post("/bundle/delete")
+def bundle_delete():
+    """Remove button on the Bundles list (admins). Body {"id": 12}. Deletes the row in table bundles (no Shopify)."""
+    if not is_admin():
+        return jsonify({"ok": False, "error": "admins only"}), 403
+    try:
+        bid = int((request.get_json(silent=True) or {}).get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "no bundle given"}), 400
+    conn = _hooks["connect"]()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM bundles WHERE id = %s RETURNING title, sku", (bid,))
+        row = cur.fetchone()
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        log(f"[BUNDLE] remove #{bid}: ERROR {ex}")
+        return jsonify({"ok": False, "error": str(ex)[:200]}), 500
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({"ok": False, "error": "bundle not found (already removed?)"}), 404
+    log(f"[BUNDLE] {g.get('user')} removed #{bid} '{row[0]}' SKU {row[1]}")
+    return jsonify({"ok": True, "id": bid})
 
 
 # ============================================================ SECTION 7: hooks
