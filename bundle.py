@@ -24,6 +24,8 @@ Where things are (change them here):
 
 import json
 import re
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_HALF_UP
 
 import psycopg2.extras
@@ -69,12 +71,36 @@ CREATE TABLE IF NOT EXISTS bundles (
 );
 ALTER TABLE bundles ADD COLUMN IF NOT EXISTS updated_by TEXT;       -- Edit (2026-11-13): last change by
 ALTER TABLE bundles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;  -- and when
+ALTER TABLE bundles ADD COLUMN IF NOT EXISTS active_until DATE;     -- listing period (2026-11-13): last day; NULL = no end
 """
 
 
 def money(x):
     """Decimal with 2 places (AED)."""
     return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# ---- LISTING PERIOD (2026-11-13, user: "if date given the stock will be zero after the date, otherwise infinity")
+LISTING_TZ = ZoneInfo("Asia/Dubai")        # the day changes at midnight UAE time
+
+
+def today_ae():
+    return datetime.now(LISTING_TZ).date()
+
+
+def bundle_stock(items, stock_of, active_until, today=None):
+    """How many bundles can be sold: 0 after active_until (that day itself still counts), else the
+    smallest (product stock // qty) over its products, from OUR database (our_stock_qty). None = a stock not known."""
+    if active_until and (today or today_ae()) > active_until:
+        return 0
+    n = None
+    for it in items or []:
+        st = stock_of.get(it.get("fi"))
+        if st is None:
+            return None
+        k = max(0, int(st)) // max(1, int(it.get("qty") or 1))
+        n = k if n is None else min(n, k)
+    return n
 
 
 # ============================================================ SECTION 3: products
@@ -191,6 +217,13 @@ def _save_bundle(bid):
     if not MIN_ITEMS <= len(picked) <= MAX_ITEMS:
         return jsonify({"ok": False, "error": f"Pick {MIN_ITEMS} to {MAX_ITEMS} products"}), 400
     dtype = body.get("discount_type") if body.get("discount_type") in ("amount", "percent") else "amount"
+    until_txt = str(body.get("active_until") or "").strip()            # 'YYYY-MM-DD' or '' = no end date
+    try:
+        until = date.fromisoformat(until_txt) if until_txt else None
+    except ValueError:
+        return jsonify({"ok": False, "error": "Active until: not a valid date"}), 400
+    if until and bid is None and until < today_ae():
+        return jsonify({"ok": False, "error": "Active until cannot be a past date"}), 400
     try:
         dval = money(body.get("discount_value") or 0)
     except Exception:
@@ -248,15 +281,16 @@ def _save_bundle(bid):
         sku = SKU_JOIN.join(it["sku"].upper() for it in items)
         for it in items:
             it.pop("shopify_id", None)
-        vals = (title, sku, json.dumps(items), total, dtype, dval, disc, total - disc, json.dumps(stock), g.get("user"))
+        vals = (title, sku, json.dumps(items), total, dtype, dval, disc, total - disc, json.dumps(stock), until,
+                g.get("user"))
         if bid is None:
             cur.execute("""INSERT INTO bundles (title, sku, items, total_price, discount_type, discount_value, discount_aed,
-                                                bundle_price, stock_check, created_by)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""", vals)
+                                                bundle_price, stock_check, active_until, created_by)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""", vals)
         else:
             cur.execute("""UPDATE bundles SET title = %s, sku = %s, items = %s, total_price = %s, discount_type = %s,
                                               discount_value = %s, discount_aed = %s, bundle_price = %s,
-                                              stock_check = %s, updated_by = %s, updated_at = NOW()
+                                              stock_check = %s, active_until = %s, updated_by = %s, updated_at = NOW()
                            WHERE id = %s RETURNING id""", vals + (bid,))
         got = cur.fetchone()
         if not got:
@@ -270,7 +304,8 @@ def _save_bundle(bid):
         return jsonify({"ok": False, "error": str(ex)[:200]}), 500
     finally:
         conn.close()
-    log(f"[BUNDLE] {what} saved #{bid} '{title}' SKU {sku}: total {total} - {disc} = {total - disc}")
+    log(f"[BUNDLE] {what} saved #{bid} '{title}' SKU {sku}: total {total} - {disc} = {total - disc}, "
+        f"active until {until or 'no end date'}")
     return jsonify({"ok": True, "id": bid, "sku": sku, "title": title, "bundle_price": float(total - disc)})
 
 
@@ -400,7 +435,17 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
   <div class="skubox" id="sku">-</div>
 </div>
 <div class="card">
-  <h2>5. {{ 'Save' if edit else 'Add' }}</h2>
+  <h2>5. Listing period</h2>
+  <p class="sub">Last day the bundle is sold. After this date its stock becomes 0. Empty = no end date.</p>
+  <div class="row2">
+    <span class="muted">Active until</span>
+    <input type="date" id="until" min="{{ today }}" oninput="refresh()" style="max-width:200px">
+    <button type="button" class="reset" onclick="document.getElementById('until').value=''; refresh()">No end date</button>
+    <span class="muted" id="untilInfo" style="font-size:13px"></span>
+  </div>
+</div>
+<div class="card">
+  <h2>6. {{ 'Save' if edit else 'Add' }}</h2>
   <p class="sub">The bundle is {{ 'saved' if edit else 'added' }} only when EVERY product has enough stock in Shopify ({{ shop or 'Shopify not set up' }}).</p>
   <button type="button" class="btn" id="addBtn" onclick="addBundle()" disabled>{{ 'Save changes' if edit else 'Add bundle' }}</button>
   {% if edit %}<a class="ghost" href="/bundle" style="text-decoration:none;margin-left:8px">Cancel</a>{% endif %}
@@ -515,6 +560,8 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     var bad = chosen.some(function (l) { return !l.p.sku || l.p.price == null; });
     var okDisc = v >= 0 && (dtype === "amount" ? disc < total : v <= 100 && disc < total);
     document.getElementById("addBtn").disabled = chosen.length < MIN || bad || !okDisc || !ti.value.trim();
+    var u = document.getElementById("until").value;                  // listing period text
+    document.getElementById("untilInfo").textContent = u ? "Stock 0 from the day after " + u : "No end date (always active)";
     var m = document.getElementById("msg");
     if (!m.dataset.keep) m.textContent = chosen.length < MIN ? "Pick at least " + MIN + " products." :
         bad ? "A product has no SKU or no UAE price." : !okDisc ? "The discount must be smaller than the total." : "";
@@ -527,7 +574,8 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     try {
       var r = await fetch(EDIT ? "/bundle/update" : "/bundle/create", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({id: EDIT ? EDIT.id : null, items: items, title: document.getElementById("title").value,
-                              discount_type: dtype, discount_value: document.getElementById("dval").value})});
+                              discount_type: dtype, discount_value: document.getElementById("dval").value,
+                              active_until: document.getElementById("until").value})});
       var d = await r.json().catch(function () { return {ok: false, error: "HTTP " + r.status}; });
       if (!d.ok) throw new Error(d.error || ("HTTP " + r.status));
       m.className = "msg ok"; m.textContent = (EDIT ? "Saved: " : "Bundle added: ") + d.title + " (SKU " + d.sku + ", " + aed(d.bundle_price) + "). ";
@@ -544,6 +592,7 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     lines = EDIT.lines;
     document.getElementById("title").value = EDIT.title; titleTouched = EDIT.title_touched;
     document.getElementById("dval").value = EDIT.discount_value; setType(EDIT.discount_type);
+    document.getElementById("until").value = EDIT.active_until || "";
     console.log("[BUNDLE] editing #" + EDIT.id);
   }
   draw();
@@ -558,6 +607,8 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
  .bar input{flex:1;min-width:220px}
  .bcard .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
  .bcard h2{font-size:18px}
+ .tag{display:inline-block;font-size:12px;border-radius:10px;padding:2px 9px;margin:6px 6px 0 0;border:1px solid var(--line);color:var(--muted)}
+ .tag.on{border-color:#6cc28a;color:#6cc28a} .tag.off{border-color:#e0806c;color:#e0806c}
  .ed{border:1px solid var(--gold);color:var(--gold);border-radius:10px;padding:7px 14px;font-size:14px;text-decoration:none;margin-right:6px}
  .ed:hover{background:rgba(242,214,117,.1)}
  .items{margin:6px 0 0;padding:0;list-style:none;font-size:14px}
@@ -585,6 +636,9 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
     <div style="flex:1;min-width:0">
       <h2>{{ b.title }}</h2>
       <div class="sku">SKU {{ b.sku }}</div>
+      {# listing period + bundle stock (0 after Active until) #}
+      <span class="tag {{ 'off' if b.ended else 'on' }}">{% if b.ended %}Ended {{ b.active_until.strftime('%d %b %Y') }}{% elif b.active_until %}Active until {{ b.active_until.strftime('%d %b %Y') }}{% else %}Active · no end date{% endif %}</span>
+      <span class="tag {{ 'off' if b.stock == 0 else '' }}">Stock {{ b.stock if b.stock is not none else '-' }}</span>
     </div>
     <div class="price">AED {{ '%.2f' % b.bundle_price }}
       <small>was AED {{ '%.2f' % b.total_price }} · discount {% if b.discount_type == 'percent' %}{{ '%g' % b.discount_value }}% = {% endif %}AED {{ '%.2f' % b.discount_aed }}</small></div>
@@ -651,7 +705,7 @@ def bundle_new():
     log(f"[BUNDLE] {g.get('user')} opened Create bundle form")
     return render_template_string(FORM_HTML, nav_html=nav_html, nav_css=nav_css, admin=is_admin(),
                                   min_items=MIN_ITEMS, max_items=MAX_ITEMS, max_qty=MAX_QTY, sku_join=SKU_JOIN,
-                                  shop=sc.SHOP, edit=None)
+                                  shop=sc.SHOP, edit=None, today=today_ae().isoformat())
 
 
 @bundle_bp.get("/bundle/edit/<int:bid>")
@@ -683,12 +737,13 @@ def bundle_edit(bid):
             lines.append({"p": p, "qty": int(it.get("qty") or 1)})
         default_title = " + ".join(l["p"]["name"] or "" for l in lines)
         edit = {"id": b["id"], "lines": lines, "title": b["title"], "title_touched": b["title"] != default_title,
-                "discount_type": b["discount_type"] or "amount", "discount_value": float(b["discount_value"] or 0)}
+                "discount_type": b["discount_type"] or "amount", "discount_value": float(b["discount_value"] or 0),
+                "active_until": b["active_until"].isoformat() if b.get("active_until") else ""}
     nav_html, nav_css = _nav("bundle-list")
     log(f"[BUNDLE] {g.get('user')} opened Edit #{bid}")
     return render_template_string(FORM_HTML, nav_html=nav_html, nav_css=nav_css, admin=is_admin(),
                                   min_items=MIN_ITEMS, max_items=MAX_ITEMS, max_qty=MAX_QTY, sku_join=SKU_JOIN,
-                                  shop=sc.SHOP, edit=edit)
+                                  shop=sc.SHOP, edit=edit, today="")
 
 
 @bundle_bp.get("/bundle")
@@ -706,8 +761,17 @@ def bundle_list():
         else:
             cur.execute("SELECT * FROM bundles ORDER BY id DESC LIMIT 500")
         rows = cur.fetchall()
+        fis = sorted({it.get("fi") for b in rows for it in (b["items"] or []) if it.get("fi")})
+        stock_of = {}
+        if fis:                                              # our stock of every product in the bundles
+            cur.execute("SELECT fi_record_id, our_stock_qty FROM competitor_table WHERE fi_record_id = ANY(%s)", (fis,))
+            stock_of = {r["fi_record_id"]: r["our_stock_qty"] for r in cur.fetchall()}
     finally:
         conn.close()
+    today = today_ae()
+    for b in rows:
+        b["ended"] = bool(b.get("active_until") and today > b["active_until"])
+        b["stock"] = bundle_stock(b["items"], stock_of, b.get("active_until"), today)
     for b in rows:                                           # numbers for the template
         for k in ("total_price", "discount_value", "discount_aed", "bundle_price"):
             b[k] = float(b[k] or 0)
