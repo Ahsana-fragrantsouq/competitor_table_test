@@ -48,6 +48,7 @@ BUNDLE_OPTIONS = [
 MIN_ITEMS, MAX_ITEMS = 2, 5          # products in one bundle
 MAX_QTY = 20                         # quantity of one product in a bundle
 SKU_JOIN = ""                        # AFN1057 + ARM1002 -> "AFN1057ARM1002" (change to "-" / "+" later if wanted)
+PICK_LIMIT = 50                      # products listed in the "Select products" popup (search narrows it down)
 
 
 # ============================================================ SECTION 2: table
@@ -106,19 +107,18 @@ def product_rows(cur, where, params, limit=15):
 
 @bundle_bp.get("/bundle/products")
 def bundle_products():
-    """?q=words -> up to 15 products (every word in SKU / brand / name / barcode, like the Item Master search)."""
+    """?q=words -> up to PICK_LIMIT products for the "Select products" popup (every word in SKU / brand / name /
+    perfume / barcode, like the Item Master search). Empty q -> the first products (popup opens with a list)."""
     q = (request.args.get("q") or "").strip()
     words = [w for w in re.split(r"\s+", q) if w][:6]
-    if not words:
-        return jsonify({"ok": True, "items": []})
-    where = " WHERE " + " AND ".join(
+    where = (" WHERE " + " AND ".join(
         "(COALESCE(im.sku,'') || ' ' || COALESCE(im.brand,'') || ' ' || COALESCE(im.product_name,'') || ' ' || "
-        "COALESCE(im.perfume_name,'') || ' ' || COALESCE(im.barcode,'')) ILIKE %s" for _ in words)
+        "COALESCE(im.perfume_name,'') || ' ' || COALESCE(im.barcode,'')) ILIKE %s" for _ in words)) if words else ""
     where += " ORDER BY (ct.our_link IS NULL), im.brand, im.product_name"
     conn = _hooks["connect"]()
     try:
         items = product_rows(conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor), where,
-                             [f"%{w}%" for w in words])
+                             [f"%{w}%" for w in words], limit=PICK_LIMIT)
     finally:
         conn.close()
     log(f"[BUNDLE] search {q!r}: {len(items)} products")
@@ -275,14 +275,6 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
  .line{display:flex;gap:10px;align-items:center;border:1px solid var(--line);border-radius:12px;padding:10px;position:relative}
  .line .num{width:24px;height:24px;border-radius:50%;background:var(--line);display:flex;align-items:center;justify-content:center;
             font-size:13px;flex:0 0 24px}
- .pick{flex:1;position:relative}
- .pick input{width:100%}
- .results{position:absolute;left:0;right:0;top:46px;z-index:20;background:#2d2b26;border:1px solid var(--line);border-radius:12px;
-          max-height:320px;overflow:auto;box-shadow:0 12px 30px rgba(0,0,0,.5)}
- .res{display:flex;gap:10px;align-items:center;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--line)}
- .res:hover,.res.sel{background:#3a3833}
- .res .t{flex:1;min-width:0} .res .t b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
- .res small{color:var(--muted)}
  .chosen{flex:1;display:flex;gap:10px;align-items:center;min-width:0}
  .chosen .t{flex:1;min-width:0} .chosen .t b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
  .chosen small{color:var(--muted)}
@@ -303,6 +295,28 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
  .skubox{font-family:ui-monospace,Consolas,monospace;background:var(--bg);border:1px solid var(--line);border-radius:10px;
          padding:10px 12px;word-break:break-all}
  .msg{margin-top:12px;font-size:14px}
+ .empty{color:var(--muted);font-size:14px;padding:14px;border:1px dashed var(--line);border-radius:12px;text-align:center}
+ /* "Select products" popup (like Shopify's) */
+ .pick-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:flex;align-items:center;justify-content:center;padding:16px}
+ .pick-bg[hidden]{display:none}
+ .pick-box{background:var(--card);border:1px solid var(--line);border-radius:16px;width:min(760px,100%);max-height:88vh;
+           display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+ .pick-head{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;font-size:18px}
+ .pclose{background:none;border:1px solid var(--line);color:var(--text);width:34px;height:34px;border-radius:50%;font-size:20px;cursor:pointer}
+ .pick-search{padding:0 20px 12px} .pick-search input{width:100%}
+ .pcols,.prow{display:grid;grid-template-columns:28px 52px 1fr 90px 110px;gap:10px;align-items:center}
+ .pcols{padding:8px 20px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}
+ .pick-list{overflow:auto;flex:1;min-height:200px}
+ .prow{padding:10px 20px;border-bottom:1px solid var(--line);cursor:pointer}
+ .prow:hover{background:#2d2b26} .prow.off{opacity:.45;cursor:default}
+ .prow input{width:18px;height:18px;padding:0;accent-color:#f2d675}
+ .pname span{display:block;font-size:14px} .pname small{color:var(--muted);font-size:12px}
+ .pavail{font-size:14px} .pavail.zero{color:#f0a35e}
+ .pprice{text-align:right;font-size:14px;white-space:nowrap}
+ .pempty{padding:24px 20px;color:var(--muted);text-align:center}
+ .pick-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 20px;border-top:1px solid var(--line)}
+ .pcount{background:var(--bg);border-radius:20px;padding:6px 12px;color:var(--muted);font-size:13px}
+ @media (max-width:600px){ .pcols,.prow{grid-template-columns:24px 44px 1fr 70px} .pprice,.pcols span:last-child{display:none} }
 </style></head><body><div class="page">
 <div class="topbar"><h1>Create bundle</h1>
   {% if g.user %}<span class="who">Logged in as <b>{{ g.user }}</b> · <a href="/logout">Log out</a></span>{% endif %}</div>
@@ -312,10 +326,23 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
 {% else %}
 <div class="card">
   <h2>1. Products</h2>
-  <p class="sub">Pick {{ min_items }} to {{ max_items }} products (search by name, brand, SKU or barcode) and set each quantity.</p>
+  <p class="sub">Pick {{ min_items }} to {{ max_items }} products and set each quantity.</p>
   <div class="lines" id="lines"></div>
-  <div style="margin-top:10px"><button type="button" class="ghost" id="addLine" onclick="addLine()">+ Add product</button>
+  <div style="margin-top:10px"><button type="button" class="ghost" id="openPick" onclick="openPicker()">Select products</button>
     <span class="muted" id="lineInfo" style="font-size:13px;margin-left:8px"></span></div>
+</div>
+{# "Select products" popup like Shopify's (search, tick, picture, Available, Price; N/5 selected; Cancel / Add) #}
+<div class="pick-bg" id="pickBg" hidden onclick="if (event.target === this) closePicker()">
+  <div class="pick-box" role="dialog" aria-label="Select products">
+    <div class="pick-head"><b>Select products</b><button type="button" class="pclose" onclick="closePicker()" aria-label="Close">&times;</button></div>
+    <div class="pick-search"><input id="pickSearch" placeholder="Search products (name, brand, SKU, barcode)" oninput="loadPick(this.value)"
+         onkeydown="if (event.key === 'Escape') closePicker()"></div>
+    <div class="pcols"><span></span><span></span><span>Product</span><span>Available</span><span style="text-align:right">Price</span></div>
+    <div class="pick-list" id="pickList"></div>
+    <div class="pick-foot"><span class="pcount" id="pickN"></span>
+      <span><button type="button" class="ghost" onclick="closePicker()">Cancel</button>
+            <button type="button" class="btn" id="pickAdd" onclick="pickDone()">Add</button></span></div>
+  </div>
 </div>
 <div class="card">
   <h2>2. Bundle title</h2>
@@ -358,62 +385,83 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     if (src) { var i = el("img", "thumb"); i.src = src; i.alt = ""; i.loading = "lazy"; return i; }
     return el("div", "thumb", "□");
   }
-  function addLine() { if (lines.length >= MAX) return; lines.push({p: null, qty: 1}); draw(); }
-  function removeLine(i) { lines.splice(i, 1); if (lines.length < MIN) lines.push({p: null, qty: 1}); draw(); }
+  // ---- chosen products (lines) ----
+  function removeLine(i) { console.log("[BUNDLE] removed " + lines[i].p.sku); lines.splice(i, 1); draw(); }
   function draw() {
     var box = document.getElementById("lines"); box.innerHTML = "";
+    if (!lines.length) box.appendChild(el("div", "empty", "No products yet - click “Select products”."));
     lines.forEach(function (ln, i) {
       var row = el("div", "line"); row.appendChild(el("span", "num", String(i + 1)));
-      if (ln.p) {
-        var c = el("div", "chosen"); c.appendChild(thumb(ln.p.image));
-        var t = el("div", "t"); t.appendChild(el("b", "", ln.p.name));
-        t.appendChild(el("small", "", (ln.p.sku || "no SKU") + " · " + (ln.p.price != null ? aed(ln.p.price) : "no UAE price") +
-                         " · Stock " + (ln.p.stock != null ? ln.p.stock : "-")));
-        c.appendChild(t); row.appendChild(c);
-        var q = el("div", "qty"); q.appendChild(el("span", "muted", "Qty"));
-        var qi = el("input"); qi.type = "number"; qi.min = 1; qi.max = MAXQ; qi.value = ln.qty;
-        qi.oninput = function () { ln.qty = Math.max(1, Math.min(MAXQ, parseInt(qi.value || "1", 10))); refresh(); };
-        q.appendChild(qi); row.appendChild(q);
-      } else {
-        var pk = el("div", "pick"), inp = el("input"); inp.placeholder = "Search product " + (i + 1) + " (name, brand, SKU, barcode)";
-        var res = el("div", "results"); res.hidden = true;
-        inp.oninput = function () { search(inp.value, res, i); };
-        inp.onkeydown = function (e) { if (e.key === "Escape") res.hidden = true; };
-        pk.appendChild(inp); pk.appendChild(res); row.appendChild(pk);
-        if (i === lines.length - 1 && !ln.focused) { ln.focused = true; setTimeout(function () { inp.focus(); }, 0); }
-      }
+      var c = el("div", "chosen"); c.appendChild(thumb(ln.p.image));
+      var t = el("div", "t"); t.appendChild(el("b", "", ln.p.name));
+      t.appendChild(el("small", "", (ln.p.sku || "no SKU") + " · " + (ln.p.price != null ? aed(ln.p.price) : "no UAE price") +
+                       " · Available " + (ln.p.stock != null ? ln.p.stock : "-")));
+      c.appendChild(t); row.appendChild(c);
+      var q = el("div", "qty"); q.appendChild(el("span", "muted", "Qty"));
+      var qi = el("input"); qi.type = "number"; qi.min = 1; qi.max = MAXQ; qi.value = ln.qty;
+      qi.oninput = function () { ln.qty = Math.max(1, Math.min(MAXQ, parseInt(qi.value || "1", 10))); refresh(); };
+      q.appendChild(qi); row.appendChild(q);
       var x = el("button", "x", "×"); x.type = "button"; x.title = "Remove"; x.onclick = function () { removeLine(i); };
       row.appendChild(x); box.appendChild(row);
     });
-    document.getElementById("addLine").disabled = lines.length >= MAX;
-    document.getElementById("lineInfo").textContent = lines.length + " of " + MAX + " lines";
+    document.getElementById("lineInfo").textContent = lines.length + " of " + MAX + " products" +
+        (lines.length < MIN ? " · pick at least " + MIN : "");
     refresh();
   }
-  function search(q, res, i) {
+  // ---- "Select products" popup (like Shopify's): search + list with tick, picture, Available, Price ----
+  var pickSel = {};                                    // fi -> product, ticked in the popup
+  function openPicker() {
+    pickSel = {}; lines.forEach(function (l) { pickSel[l.p.fi] = l.p; });   // already chosen = ticked
+    document.getElementById("pickBg").hidden = false;
+    var s = document.getElementById("pickSearch"); s.value = ""; s.focus();
+    loadPick(""); pickCount();
+    console.log("[BUNDLE] Select products opened");
+  }
+  function closePicker() { document.getElementById("pickBg").hidden = true; }
+  function pickCount() {
+    var n = Object.keys(pickSel).length;
+    document.getElementById("pickN").textContent = n + "/" + MAX + " products selected";
+    document.getElementById("pickAdd").disabled = n === 0;
+    document.querySelectorAll("#pickList input[type=checkbox]").forEach(function (cb) {
+      cb.disabled = !cb.checked && n >= MAX;                 // 5 ticked -> the others are locked
+      cb.closest(".prow").classList.toggle("off", cb.disabled);
+    });
+  }
+  function loadPick(q) {
     clearTimeout(timer);
-    if (q.trim().length < 2) { res.hidden = true; return; }
     timer = setTimeout(async function () {
+      var list = document.getElementById("pickList"); list.innerHTML = "";
+      list.appendChild(el("div", "pempty", "Loading ..."));
       try {
         var r = await fetch("/bundle/products?q=" + encodeURIComponent(q)), d = await r.json();
-        res.innerHTML = ""; res.hidden = false;
-        var used = lines.map(function (l) { return l.p && l.p.fi; });
-        if (!d.items.length) { res.appendChild(el("div", "res", "No product found")); return; }
+        list.innerHTML = "";
+        if (!d.items.length) { list.appendChild(el("div", "pempty", "No product found")); return; }
         d.items.forEach(function (p) {
-          var it = el("div", "res"); it.appendChild(thumb(p.image));
-          var t = el("div", "t"); t.appendChild(el("b", "", p.name));
-          t.appendChild(el("small", "", (p.sku || "no SKU") + " · " + (p.price != null ? aed(p.price) : "no UAE price") +
-                           " · Stock " + (p.stock != null ? p.stock : "-") + (p.on_site ? "" : " · not on fragrantsouq.com")));
-          it.appendChild(t);
-          if (used.indexOf(p.fi) >= 0) { it.style.opacity = .45; it.title = "Already in the bundle - change its quantity"; }
-          else it.onclick = function () {
-            lines[i].p = p; console.log("[BUNDLE] picked " + p.sku + " for line " + (i + 1));
-            if (lines.length < MAX && lines.every(function (l) { return l.p; }) && lines.length < MIN) lines.push({p: null, qty: 1});
-            draw();
-          };
-          res.appendChild(it);
+          var row = el("label", "prow"), cb = el("input");
+          cb.type = "checkbox"; cb.checked = !!pickSel[p.fi];
+          cb.onchange = function () { if (cb.checked) pickSel[p.fi] = p; else delete pickSel[p.fi]; pickCount(); };
+          row.appendChild(cb); row.appendChild(thumb(p.image));
+          var t = el("div", "pname"); t.appendChild(el("span", "", p.name));
+          t.appendChild(el("small", "", (p.sku || "no SKU") + (p.on_site ? "" : " · not on fragrantsouq.com")));
+          row.appendChild(t);
+          var av = el("div", "pavail" + (p.stock != null && p.stock <= 0 ? " zero" : ""),
+                      (p.stock != null && p.stock <= 0 ? "⚠ " : "") + (p.stock != null ? p.stock : "-"));
+          row.appendChild(av);
+          row.appendChild(el("div", "pprice", p.price != null ? aed(p.price) : "-"));
+          list.appendChild(row);
         });
-      } catch (e) { console.log("[BUNDLE] search failed: " + e.message); }
-    }, 250);
+        pickCount();
+      } catch (e) { list.innerHTML = ""; list.appendChild(el("div", "pempty", "Could not load: " + e.message)); }
+    }, q ? 250 : 0);
+  }
+  function pickDone() {                               // Add: ticked products become the bundle lines (order kept)
+    var keep = {}; lines.forEach(function (l) { keep[l.p.fi] = l; });
+    var next = [];
+    lines.forEach(function (l) { if (pickSel[l.p.fi]) next.push(l); });          // still ticked: keep qty
+    Object.keys(pickSel).forEach(function (fi) { if (!keep[fi]) next.push({p: pickSel[fi], qty: 1}); });
+    lines = next.slice(0, MAX);
+    console.log("[BUNDLE] products: " + lines.map(function (l) { return l.p.sku; }).join(", "));
+    closePicker(); draw();
   }
   function setType(t) {
     dtype = t;
@@ -459,10 +507,6 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     }
     setTimeout(function () { delete m.dataset.keep; }, 0);
   }
-  document.addEventListener("click", function (e) {           // click outside a result list -> close it
-    document.querySelectorAll(".results").forEach(function (r) { if (!r.parentNode.contains(e.target)) r.hidden = true; });
-  });
-  for (var k = 0; k < MIN; k++) lines.push({p: null, qty: 1, focused: k > 0});
   draw();
 </script>
 {% endif %}
