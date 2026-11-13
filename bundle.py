@@ -17,8 +17,8 @@ Where things are (change them here):
   SECTION 2  table           -> BUNDLES_CREATE (bundles)
   SECTION 3  products        -> product_rows(), GET /bundle/products?q= (search for the form)
   SECTION 4  Shopify stock   -> shopify_stock() (live 'available' of one SKU)
-  SECTION 5  create          -> POST /bundle/create
-  SECTION 6  pages           -> FORM_HTML (/bundle/new), LIST_HTML (/bundle)
+  SECTION 5  create / edit   -> POST /bundle/create, POST /bundle/update (same checks, _save_bundle)
+  SECTION 6  pages           -> FORM_HTML (/bundle/new, /bundle/edit/<id>), LIST_HTML (/bundle)
   SECTION 7  hooks           -> init(): database connection from app.py
 """
 
@@ -27,7 +27,7 @@ import re
 from decimal import Decimal, ROUND_HALF_UP
 
 import psycopg2.extras
-from flask import Blueprint, render_template_string, request, jsonify, g
+from flask import Blueprint, render_template_string, request, jsonify, g, redirect
 
 from auth import is_admin
 
@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS bundles (
     created_by      TEXT,
     created_at      TIMESTAMP DEFAULT NOW()
 );
+ALTER TABLE bundles ADD COLUMN IF NOT EXISTS updated_by TEXT;       -- Edit (2026-11-13): last change by
+ALTER TABLE bundles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;  -- and when
 """
 
 
@@ -142,15 +144,33 @@ def shopify_stock(sku, shopify_id):
     return int((r.json().get("variant") or {}).get("inventory_quantity") or 0), None
 
 
-# ============================================================ SECTION 5: create
+# ============================================================ SECTION 5: create / edit
 @bundle_bp.post("/bundle/create")
 def bundle_create():
+    """Add bundle (Create bundle form)."""
+    return _save_bundle(None)
+
+
+@bundle_bp.post("/bundle/update")
+def bundle_update():
+    """Save changes (Edit on the Bundles list, 2026-11-13). Body = create's + "id". SAME checks as Add
+    (live Shopify stock too); title / SKU / prices made again from the products now picked."""
+    try:
+        bid = int((request.get_json(silent=True) or {}).get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "no bundle given"}), 400
+    return _save_bundle(bid)
+
+
+def _save_bundle(bid):
     """Body: {items: [{fi, qty}], title, discount_type: 'amount'|'percent', discount_value}.
     Prices / SKUs / names come from OUR database (not from the page). Every product must have stock in Shopify
-    (>= its quantity), else nothing is saved and the answer lists the products that block it."""
+    (>= its quantity), else nothing is saved and the answer lists the products that block it.
+    bid None = INSERT a new bundle, else UPDATE bundle bid."""
     if not is_admin():
         return jsonify({"ok": False, "error": "admins only"}), 403
     body = request.get_json(silent=True) or {}
+    what = "Add" if bid is None else f"Edit #{bid}"
     lines = body.get("items") or []
     # ---- check what was sent
     picked, seen = [], set()
@@ -212,10 +232,11 @@ def bundle_create():
                 out.append(f"{it['name']} ({it['sku']}): {why}")
             elif avail < it["qty"]:
                 out.append(f"{it['name']} ({it['sku']}): only {avail} in stock in Shopify, bundle needs {it['qty']}")
-        log(f"[BUNDLE] {g.get('user')} Add: Shopify stock {stock}")
+        log(f"[BUNDLE] {g.get('user')} {what}: Shopify stock {stock}")
         if out:
-            log(f"[BUNDLE] NOT added - out of stock: {out}")
-            return jsonify({"ok": False, "error": "Not added - out of stock in Shopify: " + "; ".join(out),
+            log(f"[BUNDLE] {what} NOT saved - out of stock: {out}")
+            return jsonify({"ok": False, "error": ("Not added" if bid is None else "Not saved")
+                            + " - out of stock in Shopify: " + "; ".join(out),
                             "stock": stock}), 409
         # ---- price, title, SKU
         total = sum(money(it["price"]) * it["qty"] for it in items)
@@ -227,12 +248,21 @@ def bundle_create():
         sku = SKU_JOIN.join(it["sku"].upper() for it in items)
         for it in items:
             it.pop("shopify_id", None)
-        cur.execute("""INSERT INTO bundles (title, sku, items, total_price, discount_type, discount_value, discount_aed,
-                                            bundle_price, stock_check, created_by)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                    (title, sku, json.dumps(items), total, dtype, dval, disc, total - disc, json.dumps(stock),
-                     g.get("user")))
-        bid = cur.fetchone()["id"]
+        vals = (title, sku, json.dumps(items), total, dtype, dval, disc, total - disc, json.dumps(stock), g.get("user"))
+        if bid is None:
+            cur.execute("""INSERT INTO bundles (title, sku, items, total_price, discount_type, discount_value, discount_aed,
+                                                bundle_price, stock_check, created_by)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""", vals)
+        else:
+            cur.execute("""UPDATE bundles SET title = %s, sku = %s, items = %s, total_price = %s, discount_type = %s,
+                                              discount_value = %s, discount_aed = %s, bundle_price = %s,
+                                              stock_check = %s, updated_by = %s, updated_at = NOW()
+                           WHERE id = %s RETURNING id""", vals + (bid,))
+        got = cur.fetchone()
+        if not got:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "bundle not found (removed?)"}), 404
+        bid = got["id"]
         conn.commit()
     except Exception as ex:
         conn.rollback()
@@ -240,7 +270,7 @@ def bundle_create():
         return jsonify({"ok": False, "error": str(ex)[:200]}), 500
     finally:
         conn.close()
-    log(f"[BUNDLE] Added #{bid} '{title}' SKU {sku}: total {total} - {disc} = {total - disc}")
+    log(f"[BUNDLE] {what} saved #{bid} '{title}' SKU {sku}: total {total} - {disc} = {total - disc}")
     return jsonify({"ok": True, "id": bid, "sku": sku, "title": title, "bundle_price": float(total - disc)})
 
 
@@ -318,11 +348,11 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
  .pcount{background:var(--bg);border-radius:20px;padding:6px 12px;color:var(--muted);font-size:13px}
  @media (max-width:600px){ .pcols,.prow{grid-template-columns:24px 44px 1fr 70px} .pprice,.pcols span:last-child{display:none} }
 </style></head><body><div class="page">
-<div class="topbar"><h1>Create bundle</h1>
+<div class="topbar"><h1>{{ 'Edit bundle' if edit else 'Create bundle' }}</h1>
   {% if g.user %}<span class="who">Logged in as <b>{{ g.user }}</b> · <a href="/logout">Log out</a></span>{% endif %}</div>
 {{ nav_html|safe }}
 {% if not admin %}
-<div class="card"><p class="sub">Only admins can create bundles. <a href="/bundle" style="color:var(--gold)">See the bundles</a></p></div>
+<div class="card"><p class="sub">Only admins can create or edit bundles. <a href="/bundle" style="color:var(--gold)">See the bundles</a></p></div>
 {% else %}
 <div class="card">
   <h2>1. Products</h2>
@@ -370,15 +400,17 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
   <div class="skubox" id="sku">-</div>
 </div>
 <div class="card">
-  <h2>5. Add</h2>
-  <p class="sub">The bundle is added only when EVERY product has enough stock in Shopify ({{ shop or 'Shopify not set up' }}).</p>
-  <button type="button" class="btn" id="addBtn" onclick="addBundle()" disabled>Add bundle</button>
+  <h2>5. {{ 'Save' if edit else 'Add' }}</h2>
+  <p class="sub">The bundle is {{ 'saved' if edit else 'added' }} only when EVERY product has enough stock in Shopify ({{ shop or 'Shopify not set up' }}).</p>
+  <button type="button" class="btn" id="addBtn" onclick="addBundle()" disabled>{{ 'Save changes' if edit else 'Add bundle' }}</button>
+  {% if edit %}<a class="ghost" href="/bundle" style="text-decoration:none;margin-left:8px">Cancel</a>{% endif %}
   <div class="msg" id="msg"></div>
 </div>
 <script>
   // ---- Create bundle form (bundle.py): pick products -> title / discount / SKU follow -> Add (Shopify stock check) ----
   var MIN = {{ min_items }}, MAX = {{ max_items }}, MAXQ = {{ max_qty }}, JOIN = {{ sku_join|tojson }};
   var lines = [], titleTouched = false, dtype = "amount", timer = null;
+  var EDIT = {{ edit|tojson }};                        // Edit (2026-11-13): saved bundle, else null = new bundle
   function el(t, c, txt) { var e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; }
   function aed(n) { return "AED " + (Math.round(n * 100) / 100).toFixed(2); }
   function thumb(src) {
@@ -493,19 +525,26 @@ FORM_HTML = PAGE_HEAD.replace("@@TITLE@@", "Create bundle") + r"""
     var items = lines.filter(function (l) { return l.p; }).map(function (l) { return {fi: l.p.fi, qty: l.qty}; });
     btn.disabled = true; m.dataset.keep = "1"; m.className = "msg"; m.textContent = "Checking the stock in Shopify ...";
     try {
-      var r = await fetch("/bundle/create", {method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({items: items, title: document.getElementById("title").value,
+      var r = await fetch(EDIT ? "/bundle/update" : "/bundle/create", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id: EDIT ? EDIT.id : null, items: items, title: document.getElementById("title").value,
                               discount_type: dtype, discount_value: document.getElementById("dval").value})});
       var d = await r.json().catch(function () { return {ok: false, error: "HTTP " + r.status}; });
       if (!d.ok) throw new Error(d.error || ("HTTP " + r.status));
-      m.className = "msg ok"; m.textContent = "Bundle added: " + d.title + " (SKU " + d.sku + ", " + aed(d.bundle_price) + "). ";
+      m.className = "msg ok"; m.textContent = (EDIT ? "Saved: " : "Bundle added: ") + d.title + " (SKU " + d.sku + ", " + aed(d.bundle_price) + "). ";
       var a = el("a", "", "See all bundles"); a.href = "/bundle"; a.style.color = "var(--gold)"; m.appendChild(a);
-      console.log("[BUNDLE] added #" + d.id + " " + d.sku);
+      console.log("[BUNDLE] " + (EDIT ? "saved" : "added") + " #" + d.id + " " + d.sku);
+      if (EDIT) btn.disabled = false;                 // Edit: can save again
     } catch (e) {
       m.className = "msg err"; m.textContent = e.message; btn.disabled = false;
       console.log("[BUNDLE] not added: " + e.message);
     }
     setTimeout(function () { delete m.dataset.keep; }, 0);
+  }
+  if (EDIT) {                                           // Edit: fill the form with the saved bundle
+    lines = EDIT.lines;
+    document.getElementById("title").value = EDIT.title; titleTouched = EDIT.title_touched;
+    document.getElementById("dval").value = EDIT.discount_value; setType(EDIT.discount_type);
+    console.log("[BUNDLE] editing #" + EDIT.id);
   }
   draw();
 </script>
@@ -519,7 +558,8 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
  .bar input{flex:1;min-width:220px}
  .bcard .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
  .bcard h2{font-size:18px}
- .pics{display:flex;gap:6px;margin:10px 0}
+ .ed{border:1px solid var(--gold);color:var(--gold);border-radius:10px;padding:7px 14px;font-size:14px;text-decoration:none;margin-right:6px}
+ .ed:hover{background:rgba(242,214,117,.1)}
  .items{margin:6px 0 0;padding:0;list-style:none;font-size:14px}
  .items li{padding:4px 0;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:10px}
  .price{font-size:22px;font-weight:700;color:var(--yellow);text-align:right}
@@ -545,7 +585,6 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
     <div style="flex:1;min-width:0">
       <h2>{{ b.title }}</h2>
       <div class="sku">SKU {{ b.sku }}</div>
-      <div class="pics">{% for it in b['items'] %}{% if it.image %}<img class="thumb" src="{{ it.image }}" alt="" loading="lazy">{% else %}<div class="thumb">&#9633;</div>{% endif %}{% endfor %}</div>
     </div>
     <div class="price">AED {{ '%.2f' % b.bundle_price }}
       <small>was AED {{ '%.2f' % b.total_price }} · discount {% if b.discount_type == 'percent' %}{{ '%g' % b.discount_value }}% = {% endif %}AED {{ '%.2f' % b.discount_aed }}</small></div>
@@ -555,9 +594,9 @@ LIST_HTML = PAGE_HEAD.replace("@@TITLE@@", "Bundles") + r"""
       <span class="muted">AED {{ '%.2f' % (it.price * it.qty) }}</span></li>{% endfor %}
   </ul>
   <div class="foot">
-    <p class="muted" style="font-size:13px;margin:0">Added by {{ b.created_by or '-' }} on {{ b.created_at.strftime('%d %b %Y, %H:%M') }}</p>
-    {# Remove (admins, 2026-11-13): confirm box -> POST /bundle/delete -> card disappears #}
-    {% if admin %}<button type="button" class="rm" data-id="{{ b.id }}" data-title="{{ b.title }}" onclick="removeBundle(this)">Remove</button>{% endif %}
+    <p class="muted" style="font-size:13px;margin:0">Added by {{ b.created_by or '-' }} on {{ b.created_at.strftime('%d %b %Y, %H:%M') }}{% if b.updated_at %} · changed by {{ b.updated_by or '-' }} on {{ b.updated_at.strftime('%d %b %Y, %H:%M') }}{% endif %}</p>
+    {# Edit (admins) -> /bundle/edit/<id> = the form filled in; Remove: confirm box -> POST /bundle/delete -> card disappears #}
+    {% if admin %}<span><a class="ed" href="/bundle/edit/{{ b.id }}">Edit</a><button type="button" class="rm" data-id="{{ b.id }}" data-title="{{ b.title }}" onclick="removeBundle(this)">Remove</button></span>{% endif %}
   </div>
   <div class="rmmsg err" id="rmmsg-{{ b.id }}"></div>
 </div>
@@ -612,7 +651,44 @@ def bundle_new():
     log(f"[BUNDLE] {g.get('user')} opened Create bundle form")
     return render_template_string(FORM_HTML, nav_html=nav_html, nav_css=nav_css, admin=is_admin(),
                                   min_items=MIN_ITEMS, max_items=MAX_ITEMS, max_qty=MAX_QTY, sku_join=SKU_JOIN,
-                                  shop=sc.SHOP)
+                                  shop=sc.SHOP, edit=None)
+
+
+@bundle_bp.get("/bundle/edit/<int:bid>")
+def bundle_edit(bid):
+    """Edit button on the Bundles list: the Create bundle form filled with bundle bid. Products show their
+    CURRENT price / stock from our database (a product no longer in Item Master keeps its saved values)."""
+    import shopify_create as sc
+    edit = None
+    if is_admin():
+        conn = _hooks["connect"]()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(BUNDLES_CREATE)
+            conn.commit()
+            cur.execute("SELECT * FROM bundles WHERE id = %s", (bid,))
+            b = cur.fetchone()
+            if not b:
+                return redirect("/bundle")
+            saved = b["items"] or []
+            now = {r["fi"]: r for r in product_rows(cur, " WHERE im.fi_record_id = ANY(%s)",
+                                                    [[it.get("fi") for it in saved]], limit=MAX_ITEMS)}
+        finally:
+            conn.close()
+        lines = []
+        for it in saved:
+            p = now.get(it.get("fi")) or {"fi": it.get("fi"), "sku": it.get("sku"), "name": it.get("name"),
+                                          "price": it.get("price"), "image": it.get("image"), "stock": None}
+            p = {k: (float(v) if k == "price" and v is not None else v) for k, v in p.items() if k != "shopify_id"}
+            lines.append({"p": p, "qty": int(it.get("qty") or 1)})
+        default_title = " + ".join(l["p"]["name"] or "" for l in lines)
+        edit = {"id": b["id"], "lines": lines, "title": b["title"], "title_touched": b["title"] != default_title,
+                "discount_type": b["discount_type"] or "amount", "discount_value": float(b["discount_value"] or 0)}
+    nav_html, nav_css = _nav("bundle-list")
+    log(f"[BUNDLE] {g.get('user')} opened Edit #{bid}")
+    return render_template_string(FORM_HTML, nav_html=nav_html, nav_css=nav_css, admin=is_admin(),
+                                  min_items=MIN_ITEMS, max_items=MAX_ITEMS, max_qty=MAX_QTY, sku_join=SKU_JOIN,
+                                  shop=sc.SHOP, edit=edit)
 
 
 @bundle_bp.get("/bundle")
