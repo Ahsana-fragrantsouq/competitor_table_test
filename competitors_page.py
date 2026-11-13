@@ -63,7 +63,8 @@ SOURCES = [
                ("V Perfumes", "vp"), ("Al Injaz", "aj"),
                ("Ounass", "on"), ("Amberiya", "am"), ("Niche Gallerie", "ng"), ("Perfume Dubai", "pd"),
                ("MHG Boutique", "mh"), ("Emirates Pride", "ep"),
-               ("Anfasic", "an"), ("Khaltat", "kh"), ("Oud Elite", "oe"), ("Brands Perfume", "br"),
+               ("Anfasic", "an"), ("Khaltat", "kh"), ("Oud Elite", "oe"),
+               # Brands Perfume ("br") NOT on the cards (2026-11-13): competitor tab only, see app.UNLINKED_SHOPS
                ("Abdul Samad Al Qurashi", "aq"), ("Arabian Oud", "ao"),
                ("Al Jazeera Perfumes", "jz"), ("Ajmal", "jm"),
                ("Al Haramain", "ah"), ("Reef Perfumes", "rf")],

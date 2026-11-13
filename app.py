@@ -324,9 +324,18 @@ if os.environ.get("RUN2_SCHEDULER", "on").lower() != "off":
         print(f"[RUN2] Scheduler NOT started: {ex}", flush=True)
 else:
     print("[RUN2] Scheduler switched off (RUN2_SCHEDULER=off)", flush=True)
+# ---- SHOPS NOT LINKED to our products (2026-11-13, user: "remove brands perfume from linking to competitor table
+#      just be in competitor only"): the shop is still downloaded (Run 2 / Manual sync) and has its own tab under
+#      Competitors, but matching gives NO link / suggestion -> never on the Competitor table cards, never in least
+#      price / suggested price / AUTO. ct_match_shop + unlink_shop (SECTION matching), cleared at every start.
+#      To link Brands Perfume again: remove "br" here, then /competitor/match-br?secret= .
+UNLINKED_SHOPS = {"br"}
 # Brands Perfume DAILY QUICK CHECK (brandsperfume.py SECTION 6): only pages linked to our products re-read every day
 # at BR_QUICK_TIME (06:15 India) -> fresh price + stock. Render env BR_QUICK_CHECK=off switches it off.
-if os.environ.get("BR_QUICK_CHECK", "on").lower() != "off":
+# Brands Perfume not linked (UNLINKED_SHOPS) -> nothing to check -> not started.
+if "br" in UNLINKED_SHOPS:
+    print("[BR-QUICK] Not started: Brands Perfume is not linked to our products (UNLINKED_SHOPS)", flush=True)
+elif os.environ.get("BR_QUICK_CHECK", "on").lower() != "off":
     try:
         import brandsperfume
         threading.Thread(target=brandsperfume.br_quick_scheduler, daemon=True, name="br-quick").start()
@@ -1816,6 +1825,47 @@ def brand_core(bnorm):
 NO_SIZE_ONLY_SUGGEST = False
 
 
+# ---- SHOPS NOT LINKED to our products: UNLINKED_SHOPS is set in SECTION 2 (before the schedulers)
+UNLINK_COLS = ["link", "title", "price", "stock", "suggestion", "method", "score", "confirmed"]
+
+
+def unlink_shop(shop_key, only_brands=None):
+    """Clear every link / suggestion of shop_key in competitor_table (the shop's own list is NOT touched).
+    Returns the fi_record_ids that had something."""
+    p = SHOPS[shop_key]["prefix"]
+    sets = ", ".join(f"{p}_{c} = NULL" if c not in ("stock", "confirmed") else f"{p}_{c} = FALSE"
+                     for c in UNLINK_COLS)
+    where = f"({p}_link IS NOT NULL OR {p}_suggestion IS NOT NULL)"
+    params = []
+    if only_brands:
+        where += " AND LOWER(brand) = ANY(%s)"
+        params.append([b.lower() for b in only_brands])
+    conn = pg_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(CT_CREATE)
+        cur.execute(f"UPDATE competitor_table SET {sets} WHERE {where} RETURNING fi_record_id", params)
+        ids = [r[0] for r in cur.fetchall()]
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    log(f"[UNLINK-{p.upper()}] {SHOPS[shop_key]['label']}: {len(ids)} products un-linked "
+        f"(shop not linked to our products, UNLINKED_SHOPS)")
+    return ids
+
+
+def unlink_at_start():
+    """Website start: links of an un-linked shop still in the table -> cleared + least / suggested price again."""
+    try:
+        cleared = sum(len(unlink_shop(k)) for k in UNLINKED_SHOPS if k in SHOPS)
+        if cleared:
+            log(f"[UNLINK] {cleared} products changed -> least / suggested price recalculated")
+            ct_update_least()
+    except Exception as ex:
+        log(f"[UNLINK] at start FAILED: {ex}")
+
+
 def ct_match_shop(shop_key, only_brands=None, least=True):
     """STEP 2 / 3 - find every competitor_table product on ONE shop and save link / price / stock / suggestion.
 
@@ -1832,6 +1882,15 @@ def ct_match_shop(shop_key, only_brands=None, least=True):
     shop = SHOPS[shop_key]
     tag = f"CT-{shop_key.upper()}"                # log prefix: [CT-SAMAWA ...] / [CT-FF ...]
     started = time.time()
+    if shop_key in UNLINKED_SHOPS:                # not linked to our products -> only clear (see UNLINKED_SHOPS)
+        ids = unlink_shop(shop_key, only_brands)
+        if ids and least:
+            ct_update_least()
+        summary = {"step": f"match-{shop_key}", "products": 0, "unlinked": len(ids),
+                   "note": f"{shop['label']} is not linked to our products (UNLINKED_SHOPS)"}
+        state["last_summary"] = summary
+        log(f"[{tag}] skipped: {summary['note']}")
+        return summary
     summary = {"step": f"match-{shop_key}", "products": 0, "matched_barcode": 0, "matched_fuzzy": 0,
                "unmatched": 0, "with_suggestion": 0, "skipped_no_brand": 0, "brands_done": 0}
     state["last_summary"] = summary
@@ -3370,7 +3429,13 @@ def install_db_triggers():
             conn.close()
 
 
-threading.Thread(target=install_db_triggers, daemon=True).start()
+def start_jobs():
+    """Website start (background): database triggers, then un-linked shops cleared (UNLINKED_SHOPS)."""
+    install_db_triggers()
+    unlink_at_start()
+
+
+threading.Thread(target=start_jobs, daemon=True).start()
 
 
 @app.get("/competitor/update-least")
