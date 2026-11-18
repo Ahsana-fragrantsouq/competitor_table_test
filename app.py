@@ -118,7 +118,7 @@ import unicodedata
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, session
 
 # ============================================================ SECTION 1: imports + blueprints (pages in their own files)
 # New page file = import its blueprint here + app.register_blueprint(...) below.
@@ -144,7 +144,10 @@ from barcode_edit import barcode_bp                # POST /competitor/barcode
 import stock_edit                                  # admins: edit OUR stock -> Shopify (stock_edit.py)
 from stock_edit import stock_bp                    # POST /stock/edit
 import stock_sync                                  # admins: 'Sync the stock' on Brands Store tabs (stock_sync.py)
-import bundle                                      # menu Bundle -> Create bundle form (bundle.py)
+try:                                               # menu Bundle (bundle.py) - OPTIONAL: missing -> no Bundle pages
+    import bundle
+except ImportError:
+    bundle = None
 from stock_sync import stock_sync_bp               # GET /stock-sync/list?shop=
 import item_master                                 # Item Master page: all French Inventories fields (item_master.py)
 from item_master import item_master_bp             # /item-master, /item-master/reload, /load, /status
@@ -221,6 +224,55 @@ def gzip_response(resp):
     return resp
 
 
+# ---- SECURITY (2026-11-18, outside review): 1 CSRF  2 security headers. Session cookie = SameSite=Lax + HttpOnly +
+# Secure (auth.py init_auth) -> other sites' pages cannot send our login cookie with a POST. ON TOP of that:
+#   ORIGIN CHECK: every POST / PUT / PATCH / DELETE must come from a page of THIS website (browser 'Origin' header, else
+#   'Referer'). A request from another site -> 403, nothing changed (log [CSRF]). No browser header at all (scripts,
+#   curl) -> allowed: CSRF needs a browser, and browsers always send Origin on a POST. No PC script POSTs here
+#   (Run 1 / scrapers use GET ...?secret=).
+#   HEADERS on every answer: no framing by other sites (clickjacking), no MIME guessing, HTTPS only (HSTS),
+#   referrer = our site name only for other sites, CSP limited to things that cannot break the inline page code.
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'",
+}
+HSTS = "max-age=31536000"                            # 1 year; only sent over https (Render)
+
+
+@app.before_request
+def csrf_origin_check():
+    if request.method not in UNSAFE_METHODS:
+        return None
+    origin = request.headers.get("Origin")
+    src = origin if origin and origin != "null" else request.headers.get("Referer") or ""
+    if not src:
+        if origin == "null":                          # sandboxed / privacy page without Referer -> not trusted
+            log(f"[CSRF] BLOCKED {request.method} {request.path}: Origin null")
+            return jsonify({"ok": False, "error": "Request refused (not sent from this website)"}), 403
+        return None                                   # no browser header = not a browser
+    host = urlparse(src).netloc.lower()
+    if host != request.host.lower():
+        log(f"[CSRF] BLOCKED {request.method} {request.path}: from {host or src[:60]!r}, this site {request.host!r}, "
+            f"user {session.get('user')!r}")
+        return jsonify({"ok": False, "error": "Request refused (not sent from this website)"}), 403
+    return None
+
+
+@app.after_request
+def security_headers(resp):
+    try:
+        for k, v in SECURITY_HEADERS.items():
+            resp.headers.setdefault(k, v)
+        if request.is_secure or request.headers.get("X-Forwarded-Proto", "") == "https":
+            resp.headers.setdefault("Strict-Transport-Security", HSTS)
+    except Exception as ex:                           # never break a page
+        log(f"[SECURITY] headers not added: {ex}")
+    return resp
+
+
 app.register_blueprint(ff_catalog_bp)
 app.register_blueprint(samawa_catalog_bp)
 app.register_blueprint(competitors_bp)
@@ -233,7 +285,8 @@ app.register_blueprint(shopify_prices.shopify_prices_bp)   # Item Master: Load p
 app.register_blueprint(barcode_bp)                 # 'Edit' our barcode for admins (barcode_edit.py)
 app.register_blueprint(stock_bp)                   # 'Edit' our stock for admins -> Shopify (stock_edit.py)
 app.register_blueprint(stock_sync_bp)              # 'Sync the stock' popup on Brands Store tabs (stock_sync.py)
-app.register_blueprint(bundle.bundle_bp)           # menu Bundle -> /bundle/new (bundle.py)
+if bundle:
+    app.register_blueprint(bundle.bundle_bp)       # menu Bundle -> /bundle/new (bundle.py)
 app.register_blueprint(item_master_bp)             # Item Master page (item_master.py)
 app.register_blueprint(desc_bp)                    # 'Create product description' button (description_gen.py)
 app.register_blueprint(web_bp)                     # 'Create in website' button (shopify_create.py)
@@ -3376,7 +3429,8 @@ link_edit.init(connect=pg_conn, create_sql=CT_CREATE,          # 'Edit link' for
 barcode_edit.init(connect=pg_conn, airtable_barcode=airtable_set_barcode)   # 'Edit' our barcode (barcode_edit.py)
 stock_edit.init(connect=pg_conn)                                             # 'Edit' our stock -> Shopify (stock_edit.py)
 stock_sync.init(connect=pg_conn)                                             # 'Sync the stock' list (stock_sync.py)
-bundle.init(connect=pg_conn)                                                 # Bundle menu page (bundle.py)
+if bundle:
+    bundle.init(connect=pg_conn, read_airtable=at_list)                      # Bundle menu + Airtable import (bundle.py)
 shopify_prices.init(connect=pg_conn)                                         # Item Master: prices FROM Shopify (shopify_prices.py)
 item_master.init(connect=pg_conn, read_airtable=at_list,       # Item Master: Airtable -> item_master (item_master.py)
                  fi_table=FI_TABLE, brands_table=BRANDS_TABLE, brands_name_field=BRANDS_NAME_FIELD,
