@@ -118,8 +118,8 @@ def get_map(cur):
     """{brand lower case: (sku_prefix, next_sku_number, airtable_name)} for the Automate page ({} = never loaded).
     1. by NAME (brand_sku.brand = competitor_table.brand, any case)          -> airtable_name None
     2. name not found (brand renamed in Airtable after the last load-fi, e.g. "Al Majed for Oud" -> "Al Majed Oud"):
-       by the Airtable BRAND RECORD ID, which never changes: competitor_table product -> item_master.airtable_fields
-       "Brand" (record id) -> brand_sku.airtable_id                       -> airtable_name = the current Airtable name"""
+       by the Airtable BRAND RECORD ID, which never changes: competitor_table product -> item_master.brand_airtable_id
+       (record id) -> brand_sku.airtable_id                       -> airtable_name = the current Airtable name"""
     cur.execute("SELECT to_regclass('brand_sku') IS NOT NULL AS a, to_regclass('item_master') IS NOT NULL AS b, "
                 "to_regclass('competitor_table') IS NOT NULL AS c")       # named: a dict cursor needs names
     has_sku, has_im, has_ct = _vals(cur.fetchone())
@@ -132,7 +132,7 @@ def get_map(cur):
                               bs.brand AS at_name
                        FROM competitor_table ct
                        JOIN item_master im ON im.fi_record_id = ct.fi_record_id
-                       JOIN brand_sku bs ON bs.airtable_id = im.airtable_fields->'Brand'->>0
+                       JOIN brand_sku bs ON bs.airtable_id = im.brand_airtable_id
                        WHERE COALESCE(ct.brand, '') <> ''
                        ORDER BY LOWER(ct.brand), bs.brand""")
         renamed = 0
