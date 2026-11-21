@@ -303,8 +303,12 @@ def link_save():
             # removed + remembered as refused -> the next match run will not put it back
             cur.execute(f"""UPDATE competitor_table SET {shop}_link = NULL, {shop}_title = NULL, {shop}_price = NULL,
                                {shop}_stock = FALSE, {shop}_suggestion = NULL, {shop}_confirmed = FALSE,
-                               {shop}_rejected = %s, {shop}_method = 'removed by ' || %s, updated_at = NOW()
-                            WHERE fi_record_id = %s""", (old, user, fid))
+                               {shop}_rejected = CASE
+                                   WHEN COALESCE({shop}_rejected, '') = '' THEN %s
+                                   WHEN %s = ANY(string_to_array({shop}_rejected, E'\n')) THEN {shop}_rejected
+                                   ELSE {shop}_rejected || E'\n' || %s END,      -- ALL refused links kept (2026-11-21)
+                               {shop}_method = 'removed by ' || %s, updated_at = NOW()
+                            WHERE fi_record_id = %s""", (old, old, old, user, fid))
             name, price, stock = None, None, None
         else:
             # the new link must be in the shop's saved product list (a '/' at the end does not matter)
@@ -334,7 +338,8 @@ def set_link(cur, fid, shop, link, name, price, stock, user, recalc=True):
     """Put ONE competitor product on OUR product (competitor_table <shop>_*), CONFIRMED so matching keeps it.
     Also used by new_link.py ("Add new link"). recalc=True: FF sisters + least / suggested price at once (no commit)."""
     sister = shop in ("bp", "es")                     # no suggestion / method / score columns
-    extra = "" if sister else f", {shop}_suggestion = NULL, {shop}_method = 'set by ' || %s, {shop}_score = NULL, {shop}_rejected = NULL"
+    # {shop}_rejected is KEPT (2026-11-21): links refused earlier stay refused even after a link is set by hand
+    extra = "" if sister else f", {shop}_suggestion = NULL, {shop}_method = 'set by ' || %s, {shop}_score = NULL"
     cur.execute(f"""UPDATE competitor_table SET {shop}_link = %s, {shop}_title = %s, {shop}_price = %s,
                        {shop}_stock = %s, {shop}_confirmed = TRUE{extra}, updated_at = NOW()
                     WHERE fi_record_id = %s""",
