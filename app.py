@@ -3224,6 +3224,40 @@ def ct_update_prices_route():
 # /competitor/load-our-links, match-xx routes, /competitor/update-price, /competitor/update-least.
 # ---------------------------------------------------------------- OUR product pages (fragrantsouq.com)
 OUR_SITE = os.environ.get("OUR_SITE", "https://fragrantsouq.com")
+# TEST SITE (2026-11-24, user: "why connect test site to live shopify, change that to devfragrantsouq"): our links +
+# in / out of stock are read from the TEST store (SHOPIFY_SHOP, e.g. devfragrantsouq) through its Admin API - its shop
+# pages are password protected, so the public products.json used for the live shop does not work there.
+OUR_LINKS_QUERY = """query($after: String) { products(first: 100, after: $after) {
+  pageInfo { hasNextPage endCursor }
+  edges { node { handle title variants(first: 50) { edges { node { legacyResourceId sku availableForSale } } } } } } }"""
+
+
+def our_links_from_admin():
+    """{SKU: (link, title, in stock)} of the store in SHOPIFY_SHOP (test site), through the Admin GraphQL API."""
+    import shopify_create as sc
+    by_sku, after, pages = {}, None, 0
+    while True:
+        d = sc.shopify_graphql(OUR_LINKS_QUERY, {"after": after})
+        if d.get("errors"):
+            raise RuntimeError(f"Shopify: {str(d['errors'])[:200]}")
+        prods = d["data"]["products"]
+        for e in prods["edges"]:
+            p = e["node"]
+            variants = [v["node"] for v in p["variants"]["edges"]]
+            for v in variants:
+                sku = (v.get("sku") or "").strip().upper()
+                if not sku:
+                    continue
+                url = f"https://{sc.SHOP}/products/{p['handle']}"
+                if len(variants) > 1:
+                    url += f"?variant={v.get('legacyResourceId')}"
+                by_sku[sku] = (url, (p.get("title") or "").strip(), bool(v.get("availableForSale")))
+        pages += 1
+        log(f"[OUR] test store {sc.SHOP}: page {pages}, {len(by_sku)} SKUs")
+        if not prods["pageInfo"]["hasNextPage"]:
+            return by_sku
+        after = prods["pageInfo"]["endCursor"]
+        time.sleep(0.5)
 
 
 def our_stock_numbers():
@@ -3277,6 +3311,10 @@ def ct_load_our_links(only_brands=None):
     state["last_summary"] = summary
     by_sku = {}
     page = 1
+    if TEST_SITE:                                        # test site: the TEST store (devfragrantsouq), never the live one
+        by_sku = our_links_from_admin()
+        summary["shopify_products"] = len(by_sku)
+        page = 101                                       # public live-shop list below is skipped
     while page <= 100:                                   # Shopify limit: 100 pages x 250 = 25,000 products
         r = None
         for wait in (0, 10, 30, 60):
