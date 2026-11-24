@@ -58,6 +58,33 @@ PER_PAGE = 50
 # ============================================================ SECTION 2: tabs / shops (SOURCES)
 # One entry per tab. New competitor shop = new table in the database + ONE entry here (key, label, table, columns).
 # Each "cols" entry is the SQL used for that field (None = column not available for this source)
+
+# ---- SEVERAL SKUs at once (2026-11-23, user: "write multiple SKUs with comma in the search box"):
+# "AMG1056, AMG1058" -> products matching ANY part. A part matches when it IS the SKU / barcode / code (exact, any
+# capitals - so AMG1056 does not also bring AMG10561) or is IN the name / brand. No comma -> search as before.
+MULTI_EXACT = {"sku", "barcode", "gtin", "french_inventory_code", "fi_record_id"}
+
+
+def multi_terms(q):
+    """'AMG1056, AMG1058' -> ['AMG1056', 'AMG1058'] (max 200); no comma -> None."""
+    if "," not in (q or ""):
+        return None
+    parts = [t.strip() for t in q.split(",") if t.strip()]
+    return parts[:200] or None
+
+
+def multi_where(terms, cols, prefix=""):
+    """SQL (string, params) for terms ORed: exact on SKU / barcode columns, contains on the others."""
+    ors, params = [], []
+    for t in terms:
+        for c in cols:
+            col = f"{prefix}{c}"
+            if c.split(".")[-1] in MULTI_EXACT:
+                ors.append(f"CAST({col} AS TEXT) ILIKE %s"); params.append(t.replace("%", r"\%").replace("_", r"\_"))
+            else:
+                ors.append(f"CAST({col} AS TEXT) ILIKE %s"); params.append(f"%{t}%")
+    return "(" + " OR ".join(ors) + ")", params
+
 SOURCES = [
     # Competitor table: one row per French Inventories product + Samawa match (filled by migrate_competitor_table.py)
     {"key": "competitor", "label": "Competitor table", "table": "competitor_table", "kind": "competitor",
@@ -1499,8 +1526,15 @@ def competitors():
             where, params = [], []
             if q:
                 search_cols = src.get("search") or [col for col in (c["name"], c["brand"], c["gtin"]) if col]
-                where.append("(" + " OR ".join(f"{col} ILIKE %s" for col in search_cols) + ")")
-                params += [f"%{q}%"] * len(search_cols)
+                terms = multi_terms(q)
+                if terms:                                  # "SKU1, SKU2, ..." -> any of them
+                    w_sql, w_params = multi_where(terms, search_cols)
+                    where.append(w_sql)
+                    params += w_params
+                    print(f"[SEARCH] {src['key']}: {len(terms)} SKUs / words separated by commas", flush=True)
+                else:
+                    where.append("(" + " OR ".join(f"{col} ILIKE %s" for col in search_cols) + ")")
+                    params += [f"%{q}%"] * len(search_cols)
             # "Missing item" = this competitor product is not linked to any of our products
             # (its link is not in competitor_table.<tab>_link, e.g. samawa_link, vp_link ...)
             missing_sql = None

@@ -652,10 +652,16 @@ def item_master_page():
         if q:
             # EVERY typed word must be somewhere in SKU / brand / names / barcode, any order (2026-11-04: the whole
             # sentence had to match exactly -> 'Abdul Samad Al Qurashi Body Oud Berries' missed the 30 ml CPO product)
-            words = q.split()[:8]
-            allcols = "CONCAT_WS(' ', " + ", ".join(f"im.{c}" for c in SEARCH_COLS) + ")"
-            where = "WHERE " + " AND ".join(f"{allcols} ILIKE %s" for _ in words)
-            params = [f"%{w}%" for w in words]
+            terms = competitors_page.multi_terms(q)
+            if terms:                                      # "SKU1, SKU2, ..." -> any of them (2026-11-23)
+                w_sql, params = competitors_page.multi_where(terms, SEARCH_COLS, prefix="im.")
+                where = "WHERE " + w_sql
+                print(f"[ITEM-MASTER] search: {len(terms)} SKUs / words separated by commas", flush=True)
+            else:
+                words = q.split()[:8]
+                allcols = "CONCAT_WS(' ', " + ", ".join(f"im.{c}" for c in SEARCH_COLS) + ")"
+                where = "WHERE " + " AND ".join(f"{allcols} ILIKE %s" for _ in words)
+                params = [f"%{w}%" for w in words]
         cur.execute(f"SELECT COUNT(*) AS n FROM item_master im {where}", params)
         total = cur.fetchone()["n"]
         # our fragrantsouq.com link comes from competitor_table (same product = same Airtable record id)
