@@ -183,6 +183,7 @@ from ajmal import ajmal_bp                         # /ajmal/test, /ajmal/run, /a
 from alharamain import alharamain_bp               # /alharamain/test, /alharamain/run, /alharamain/status
 from reefperfumes import reefperfumes_bp           # /reefperfumes/test, /reefperfumes/run, /reefperfumes/status
 import brand_refresh                               # Item Master -> Brands: Refresh all / one brand (brand_refresh.py)
+from newdb import newdb_bp                         # NEW DATABASE v2 steps 1+2: /newdb/test, /newdb/run, /newdb/status (newdb.py)
 # price_check.py is optional: if the file is not uploaded to GitHub, the app still starts (without /price-check)
 try:
     from price_check import price_check_bp         # /price-check/run, /price-check/status (daily price check)
@@ -314,6 +315,9 @@ app.register_blueprint(ajmal_bp)                   # Ajmal (ajmal.py, menu Brand
 app.register_blueprint(alharamain_bp)              # Al Haramain (alharamain.py, menu Brands Store)
 app.register_blueprint(reefperfumes_bp)            # Reef Perfumes (reefperfumes.py, menu Brands Store)
 app.register_blueprint(brand_refresh.refresh_bp)   # POST /brands/refresh, GET /brands/refresh/status
+# NEW DATABASE v2 (2026-11-26, user: "i want to redesign my database as explained in files"): new tables are built
+# NEXT TO the old ones (newdb.py + db_v2/*.sql). The pages still use the old tables. Refused on french_fragrance_db.
+app.register_blueprint(newdb_bp)
 if price_check_bp is not None:
     app.register_blueprint(price_check_bp)
     print("[PC] Daily price check routes registered: /price-check/run, /price-check/status", flush=True)
