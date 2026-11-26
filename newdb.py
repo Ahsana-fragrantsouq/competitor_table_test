@@ -537,6 +537,10 @@ def job(save):
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
+        # one run at a time across ALL website processes (the threading lock only covers one process)
+        cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('newdb_job'))")
+        if not cur.fetchone()[0]:
+            raise RuntimeError("another /newdb run is still going - wait for it to finish")
         apply_migrations(cur, report)                # step 1 and step 2 in ONE transaction:
         copy_reference_data(cur, report)             # any error -> nothing at all is saved
         report["new_table_counts"] = counts(cur)
@@ -559,7 +563,23 @@ def job(save):
             conn.close()
         report["seconds"] = round(time.time() - started, 1)
         log(f"[NEWDB] {report['result']} in {report['seconds']} s")
+        save_report(report)
         lock.release()
+
+
+# 2026-11-26: the website runs in several processes; each had its own `status`, so /newdb/status could show an
+# old "running". The finished report is now saved in table public.newdb_reports -> every process shows the same.
+def save_report(report):
+    try:
+        c = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
+        cur = c.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS public.newdb_reports (
+                           id SERIAL PRIMARY KEY, finished_at TIMESTAMPTZ NOT NULL DEFAULT now(), report JSONB)""")
+        cur.execute("INSERT INTO public.newdb_reports (report) VALUES (%s)", (psycopg2.extras.Json(report, dumps=lambda o: json.dumps(o, default=str)),))
+        c.commit()
+        c.close()
+    except Exception as ex:
+        log(f"[NEWDB] could not save the report: {ex}")
 
 
 def start(save):
@@ -592,10 +612,19 @@ def newdb_run():
 def newdb_status():
     if not secret_ok():
         return jsonify({"ok": False, "error": "wrong secret"}), 403
-    out = dict(status)
+    out = {"running_in_this_process": status.get("state") == "running"}
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
+        if exists(cur, "public.newdb_reports"):
+            cur.execute("SELECT finished_at::text, report FROM public.newdb_reports ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                out["state"] = "done"
+                out["finished_at"], out["report"] = row
+        if "report" not in out:
+            out["state"] = "no finished run yet" if not out["running_in_this_process"] else "running"
+            out["report"] = status.get("report")
         out["saved_now"] = counts(cur)
         if exists(cur, "public.newdb_migrations"):
             cur.execute("SELECT name, applied_at::text FROM public.newdb_migrations ORDER BY name")
