@@ -31,6 +31,9 @@ Links (open in the browser, ?secret=RUN_SECRET):
   /newdb-cost/test?secret=...  READS "Cost" of every product from Airtable French Inventories, shows what would be
                                saved in core.cost_history, then undoes it. (Airtable is only read, never changed.)
   /newdb-cost/run?secret=...   same, SAVED. Needs /newdb/run done first. Safe to repeat: only changed costs are added.
+  /newdb-shops/test?secret=...&shops=am,mh   step 3: copies those shops' lists (default: all shops) into
+                               competitor.listings, shows the result, then undoes it.
+  /newdb-shops/run?secret=...&shops=am,mh    same, SAVED. Safe to repeat (rows updated, never doubled).
 
 SAFETY: refuses to run on the production database (french_fragrance_db). This is the test copy.
 
@@ -615,6 +618,199 @@ def copy_costs(cur, report, records):
     report["cost_not_saved_details"] = no_product
 
 
+# ============================================================ SECTION 3c: step 3 - shop lists -> competitor.listings
+# 2026-11-26 (user: "start step 3"). Design step 3: every shop's product list goes into ONE table,
+# competitor.listings, one row per shop + page + size (Shopify variant). The old <shop>_catalog tables and the
+# scrapers are NOT changed: this copies from them (safe to repeat - rows are updated, never doubled), so the
+# Competitor table keeps working on the old tables meanwhile.
+#   price_inc_vat : ALWAYS with 5% VAT. Samawa's 'price' already has VAT; the others: price_inc_tax, or price x 1.05
+#   stock_status  : In stock -> in_stock, Out of stock -> out_of_stock, Not on site -> not_on_site
+#   check_status  : Branded Perfume / Essenzi 'status' ok -> ok, not_found -> page_missing, blocked/error -> failed
+#   last_success_at only moves when the page was read OK -> old prices of failed pages stop counting (design)
+#   text cleaned on the way in ("Â", "â€™" from wrong encoding)
+# Shops and their columns: db_triggers.SHOP_LISTS (the same list Trigger A uses).
+SHOP_EXTRA = {   # shop -> (name column, size column, status column) where they differ from name / volume / -
+    "bp": ("bp_title", "bp_size", "bp_status"),
+    "es": ("es_title", "es_size", "es_status"),
+}
+STOCK_MAP = {"in stock": "in_stock", "out of stock": "out_of_stock", "not on site": "not_on_site"}
+GIFT_RE = re.compile(r"\b(gift set|set|coffret)\b", re.I)
+
+
+def clean_text(v):
+    """Fix text saved with the wrong encoding: 'CrÃ¨me' -> 'Crème', 'Itâ€™s' -> 'It's', stray 'Â' removed."""
+    v = text(v)
+    if not v:
+        return None
+    if "Ã" in v or "â€" in v or "Â" in v:
+        for enc in ("cp1252", "latin-1"):              # UTF-8 that was read as Windows-1252 / Latin-1
+            try:
+                v = v.encode(enc).decode("utf-8")
+                break
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+    v = v.replace("Â ", " ").replace("Â", "").replace(" ", " ")
+    return " ".join(v.split()) or None
+
+
+def clean_gtin(v):
+    d = re.sub(r"\D", "", str(v or ""))
+    return d if 8 <= len(d) <= 14 else None
+
+
+def any_size_ml(label):
+    """'100 ml' / 'EDP 100ML' / '3.4 oz' -> ml (first size found), else None."""
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ml\b", label or "", re.I)
+    if m and float(m.group(1)) > 0:
+        return float(m.group(1))
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:fl\.?\s*)?oz\b", label or "", re.I)
+    return round(float(m.group(1)) * 29.5735, 0) if m and float(m.group(1)) > 0 else None
+
+
+class BrandFinder:
+    """Brand of a shop row: from its brand column (any capitals, ' Beauty' / ' Parfums' dropped) or, for shops
+    without one (FF, V Perfumes, Al Injaz ...), from the start of the product name. Longest brand name wins."""
+    SUFFIX = re.compile(r"\s+(beauty|fragrances?|parfums?|perfumes?|cosmetics|paris)$", re.I)
+
+    def __init__(self, cur):
+        cur.execute("SELECT id, name::text, aliases FROM core.brands")
+        self.by_name, self.by_first = {}, {}
+        for bid, name, aliases in cur.fetchall():
+            for n in [name] + list(aliases or []):
+                k = " ".join(n.lower().split())
+                if not k:
+                    continue
+                self.by_name.setdefault(k, bid)
+                self.by_first.setdefault(k.split()[0], []).append((k, bid))
+        for lst in self.by_first.values():
+            lst.sort(key=lambda x: -len(x[0]))
+
+    def find(self, brand_raw, name):
+        k = " ".join((brand_raw or "").lower().split())
+        if k:
+            if k in self.by_name:
+                return self.by_name[k]
+            k2 = self.SUFFIX.sub("", k).strip()
+            if k2 in self.by_name:
+                return self.by_name[k2]
+        n = " ".join((name or "").lower().split())
+        for cand, bid in self.by_first.get(n.split()[0] if n else "", []):
+            if n == cand or n.startswith(cand + " "):
+                return bid
+        return None
+
+
+def copy_shop_lists(cur, report, only=None):
+    from db_triggers import SHOP_LISTS                     # (shop, table, link column, price columns, stock column)
+    cur.execute("SET LOCAL TIME ZONE 'UTC'")               # old times without zone were written by NOW() (UTC)
+    if not exists(cur, "core.brands"):
+        raise RuntimeError("the new tables are not saved yet - open /newdb/run first")
+    cur.execute("SELECT code FROM competitor.shops")
+    known = {r[0] for r in cur.fetchall()}
+    lists = [x for x in SHOP_LISTS if only is None or x[0] in only]
+    unknown = sorted(set(only or []) - {x[0] for x in SHOP_LISTS})
+    if unknown:
+        raise RuntimeError(f"unknown shop code(s): {unknown}. Codes: {[x[0] for x in SHOP_LISTS]}")
+    brands = BrandFinder(cur)
+    report["shops"] = {}
+    for shop, table, link_col, price_cols, stock_col in lists:
+        r = report["shops"][shop] = {"from_table": table}
+        if shop not in known:
+            r["result"] = "skipped: shop not in competitor.shops"
+            continue
+        if not exists(cur, "public." + table):
+            r["result"] = "skipped: table does not exist (shop never downloaded)"
+            continue
+        have = columns(cur, table)
+        name_c, size_c, status_c = SHOP_EXTRA.get(shop, ("name", "volume", None))
+
+        def col(c, fallback=None):
+            return c if c and c in have else (fallback if fallback and fallback in have else "NULL")
+        inc_c = price_cols[0] if len(price_cols) == 2 else None      # with VAT
+        ex_c = price_cols[-1]                                       # Samawa: its only 'price' (already with VAT)
+        sel = [col(link_col), col("variant_id"), col("product_id"), col("gtin"), col("sku"), col("brand"),
+               f"COALESCE({col(name_c)}, {col('name')})" if name_c != "name" else col("name"),
+               col("product_type"),
+               f"COALESCE({col(size_c)}, {col('volume')})" if size_c != "volume" else col("volume"),
+               col(inc_c), col(ex_c), col(stock_col), col(status_c), col("checked_at"), col("updated_at")]
+        cur.execute(f"SELECT {', '.join(sel)} FROM public.{table}")
+        rows, seen = [], set()
+        stats = {"rows_in_old_list": 0, "no_link": 0, "same_page_twice": 0, "no_price": 0,
+                 "brand_found": 0, "with_barcode": 0, "with_size": 0, "price_from_ex_vat_x_1_05": 0}
+        for (url, variant, pid, gtin, sku, brand, name, ptype, size, inc, ex, stock, status, checked,
+             updated) in cur.fetchall():
+            stats["rows_in_old_list"] += 1
+            url = text(url)
+            if not url:
+                stats["no_link"] += 1                  # Branded Perfume / Essenzi page not found yet
+                continue
+            variant = text(variant)
+            k = (url, variant or "")
+            if k in seen:
+                stats["same_page_twice"] += 1
+                continue
+            seen.add(k)
+            name = clean_text(name) or url
+            if shop == "samawa":
+                price = money(ex)
+            elif inc is not None:
+                price = money(inc)
+            elif ex is not None:
+                price = money(float(ex) * 1.05)
+                stats["price_from_ex_vat_x_1_05"] += 1
+            else:
+                price = None
+            if price is None:
+                stats["no_price"] += 1
+            st = STOCK_MAP.get((stock or "").strip().lower(), "unknown")
+            s_ = (status or "").strip().lower()
+            if status_c and s_:
+                check = "ok" if s_ == "ok" else ("page_missing" if "not_found" in s_ or "missing" in s_ else "failed")
+            else:
+                check = "page_missing" if st == "not_on_site" else "ok"
+            when = checked or updated
+            success = when if check == "ok" and price is not None else None
+            bid = brands.find(brand, name)
+            gt = clean_gtin(gtin)
+            size = clean_text(size)
+            ml = any_size_ml(size) or any_size_ml(name)
+            stats["brand_found"] += 1 if bid else 0
+            stats["with_barcode"] += 1 if gt else 0
+            stats["with_size"] += 1 if ml else 0
+            low = name.lower()
+            rows.append((shop, url, text(pid), variant, gt, text(sku), clean_text(brand), bid, name,
+                         clean_text(ptype), ml, size, "tester" in low, bool(GIFT_RE.search(low)), price, st,
+                         check, when, success))
+        for i in range(0, len(rows), 1000):
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO competitor.listings (shop_code, url, external_product_id, external_variant_id, gtin,
+                    shop_sku, brand_raw, brand_id, name, product_type, size_ml, size_label, is_tester, is_gift_set,
+                    price_inc_vat, stock_status, check_status, last_checked_at, last_success_at)
+                VALUES %s
+                ON CONFLICT (shop_code, url, COALESCE(external_variant_id, '')) DO UPDATE SET
+                  external_product_id = EXCLUDED.external_product_id, gtin = EXCLUDED.gtin,
+                  shop_sku = EXCLUDED.shop_sku, brand_raw = EXCLUDED.brand_raw,
+                  brand_id = COALESCE(EXCLUDED.brand_id, competitor.listings.brand_id), name = EXCLUDED.name,
+                  product_type = EXCLUDED.product_type, size_ml = EXCLUDED.size_ml, size_label = EXCLUDED.size_label,
+                  is_tester = EXCLUDED.is_tester, is_gift_set = EXCLUDED.is_gift_set,
+                  price_inc_vat = COALESCE(EXCLUDED.price_inc_vat, competitor.listings.price_inc_vat),
+                  stock_status = EXCLUDED.stock_status, check_status = EXCLUDED.check_status,
+                  last_checked_at = EXCLUDED.last_checked_at,
+                  last_success_at = COALESCE(EXCLUDED.last_success_at, competitor.listings.last_success_at)""",
+                rows[i:i + 1000])
+        cur.execute("""SELECT count(*), count(*) FILTER (WHERE stock_status = 'in_stock'),
+                              max(last_success_at)::text FROM competitor.listings WHERE shop_code = %s""", (shop,))
+        total, in_stock, newest = cur.fetchone()
+        cur.execute("UPDATE competitor.shops SET last_success_at = %s::timestamptz WHERE code = %s AND %s IS NOT NULL",
+                    (newest, shop, newest))
+        stats.update(copied=len(rows), listings_now=total, in_stock_now=in_stock, newest_price_read=newest)
+        r.update(stats)
+        r["result"] = "ok"
+        log(f"[NEWDB-SHOPS] {shop}: {len(rows)} rows -> competitor.listings ({total} now)")
+    cur.execute("SELECT count(*) FROM competitor.listing_history")
+    report["listing_history_rows"] = cur.fetchone()[0]
+
+
 # ============================================================ SECTION 4: counts
 V2_TABLES = ["ops.users", "ops.settings", "ops.run_state", "core.brands", "core.option_values", "core.products",
              "core.product_listings", "core.stock_levels", "core.cost_history", "competitor.shops",
@@ -633,9 +829,13 @@ def counts(cur):
 
 
 # ============================================================ SECTION 5: the job (background thread)
-def job(save, kind="all"):
+JOB_NAMES = {"all": "steps 1 + 2", "cost": "Airtable cost -> core.cost_history",
+             "shops": "step 3: shop lists -> competitor.listings"}
+
+
+def job(save, kind="all", shops=None):
     started = time.time()
-    report = {"job": "Airtable cost -> core.cost_history" if kind == "cost" else "steps 1 + 2",
+    report = {"job": JOB_NAMES[kind],
               "mode": "RUN (saved)" if save else "TEST (nothing saved)", "database": db_name(),
               "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     status.clear()
@@ -652,6 +852,8 @@ def job(save, kind="all"):
             raise RuntimeError("another /newdb run is still going - wait for it to finish")
         if kind == "cost":
             copy_costs(cur, report, airtable)
+        elif kind == "shops":
+            copy_shop_lists(cur, report, shops)
         else:
             apply_migrations(cur, report)            # step 1 and step 2 in ONE transaction:
             copy_reference_data(cur, report)         # any error -> nothing at all is saved
@@ -661,8 +863,8 @@ def job(save, kind="all"):
             report["result"] = "SAVED"
         else:
             conn.rollback()
-            report["result"] = ("TEST OK - everything undone, nothing saved. Open "
-                                + ("/newdb-cost/run" if kind == "cost" else "/newdb/run") + " to save.")
+            again = {"all": "/newdb/run", "cost": "/newdb-cost/run", "shops": "/newdb-shops/run"}[kind]
+            report["result"] = f"TEST OK - everything undone, nothing saved. Open {again} to save."
         status["state"] = "done"
     except Exception as ex:
         if conn:
@@ -695,7 +897,7 @@ def save_report(report):
         log(f"[NEWDB] could not save the report: {ex}")
 
 
-def start(save, kind="all"):
+def start(save, kind="all", shops=None):
     if not secret_ok():
         return jsonify({"ok": False, "error": "wrong secret"}), 403
     if db_name() == PRODUCTION_DB:
@@ -704,7 +906,7 @@ def start(save, kind="all"):
                                               "The new tables are tried on the test copy first."}), 403
     if not lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "already running - see /newdb/status"}), 409
-    threading.Thread(target=job, args=(save, kind), daemon=True, name="newdb").start()
+    threading.Thread(target=job, args=(save, kind, shops), daemon=True, name="newdb").start()
     return jsonify({"ok": True, "started": "run (saves)" if save else "test (saves nothing)",
                     "see": "/newdb/status?secret=..."})
 
@@ -733,6 +935,24 @@ def newdb_cost_run():
     return start(save=True, kind="cost")
 
 
+def wanted_shops():
+    """?shops=am,mh -> ['am', 'mh'];  ?shops=all or nothing -> None (= every shop)."""
+    v = (request.args.get("shops") or "").strip().lower()
+    return None if v in ("", "all") else [x.strip() for x in v.split(",") if x.strip()]
+
+
+@newdb_bp.route("/newdb-shops/test")
+def newdb_shops_test():
+    """Shop lists -> competitor.listings, then undone (nothing saved). ?shops=am,mh (default: all shops)."""
+    return start(save=False, kind="shops", shops=wanted_shops())
+
+
+@newdb_bp.route("/newdb-shops/run")
+def newdb_shops_run():
+    """Shop lists -> competitor.listings, saved. ?shops=am,mh (default: all shops)."""
+    return start(save=True, kind="shops", shops=wanted_shops())
+
+
 @newdb_bp.route("/newdb/status")
 def newdb_status():
     if not secret_ok():
@@ -745,8 +965,9 @@ def newdb_status():
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
-        for label, job_name in (("last_cost_import", "Airtable cost -> core.cost_history"),
-                                ("last_steps_1_2", "steps 1 + 2")):
+        for label, job_name in (("last_shop_lists", JOB_NAMES["shops"]),
+                                ("last_cost_import", JOB_NAMES["cost"]),
+                                ("last_steps_1_2", JOB_NAMES["all"])):
             row = None
             if exists(cur, "public.newdb_reports"):
                 cur.execute("""SELECT finished_at::text, report FROM public.newdb_reports
