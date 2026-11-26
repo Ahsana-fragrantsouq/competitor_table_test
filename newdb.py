@@ -181,7 +181,16 @@ def copy_brands(cur, report, im):
         return brands.get(k)
 
     bad_prefix, dup_prefix, used_prefix, used_at = [], [], set(), set()
+    # 2026-11-26 (test run report): prefix -> brand, used when a product's brand is empty (ADP1022 -> Acqua Di Parma).
+    # Only prefixes that belong to ONE brand (LXR is shared by 5 brands -> not used).
+    owners = {}
+    for name, prefix, _, _, _ in sku_rows:
+        p = (text(prefix) or "").upper()
+        if p and key(name) and key(name) != JUNK:
+            owners.setdefault(p, set()).add(key(name))
     for name, prefix, nxt, at_id, by in sku_rows:
+        if key(name) == JUNK:                       # junk record "085715166586" is not a brand
+            continue
         b = add(name)
         if not b:
             continue
@@ -207,9 +216,10 @@ def copy_brands(cur, report, im):
     for name, _ in auto_rows:
         add(name)
     for r in im:
-        add(r["brand"])
+        if key(r["brand"]) != JUNK:
+            add(r["brand"])
 
-    data = [(b["name"], b["prefix"], b["next"], auto.get(k, False),
+    data =[(b["name"], b["prefix"], b["next"], auto.get(k, False),
              money(disc[k][1]) if k in disc else None, b["airtable_id"], b["created_by"] or "import")
             for k, b in brands.items()]
     psycopg2.extras.execute_values(cur, """
@@ -227,7 +237,9 @@ def copy_brands(cur, report, im):
                         "without_sku_prefix": [d[0] for d in data if not d[1]][:30],
                         "bad_prefix_left_empty": bad_prefix, "duplicate_prefix_left_empty": dup_prefix,
                         "automatic": sum(1 for d in data if d[3]), "own_discount": sum(1 for d in data if d[4] is not None)}
-    return dict(cur.fetchall())
+    brand_ids = dict(cur.fetchall())
+    by_prefix = {p: brand_ids[next(iter(ks))] for p, ks in owners.items() if len(ks) == 1 and next(iter(ks)) in brand_ids}
+    return brand_ids, by_prefix
 
 
 def copy_options(cur, report, im):
@@ -272,22 +284,35 @@ def read_item_master(cur):
     return out, skipped
 
 
-def copy_products(cur, report, im, skipped, brand_ids):
+def completeness(r):
+    """Higher = better record. Used when one SKU is in Item Master twice (2026-11-26: PRD1043 = a full record +
+    a leftover with no brand and name 'Perfume') -> the fuller one is copied."""
+    return (bool(text(r["brand"])), bool(text(r["barcode"])), r["uae_price"] is not None,
+            bool(text(r["shopify_id"])), len(text(r["product_name"]) or ""), bool(text(r["perfume_name"])))
+
+
+def copy_products(cur, report, im, skipped, brand_ids, by_prefix):
     data, no_sku, no_brand, dup_sku, bad_barcode, seen = [], [], [], [], [], set()
-    for r in im:
+    brand_from_prefix = 0
+    for r in sorted(im, key=completeness, reverse=True):      # best record of each SKU first
         fid, sku = r["fi_record_id"], text(r["sku"])
         if not sku:
-            no_sku.append(fid)
+            no_sku.append(f"{fid}: {text(r['product_name']) or '(no name)'}")
             continue
         if sku in seen:
-            dup_sku.append(sku)
+            dup_sku.append(f"{sku}: {fid} '{text(r['product_name']) or ''}' not copied (the fuller record was kept)")
             continue
         bid = brand_ids.get(key(r["brand"]))
+        if not bid and not text(r["brand"]):                   # empty brand -> brand of the SKU prefix
+            m = re.match(r"([A-Za-z]{3,4})[0-9]", sku)
+            bid = by_prefix.get(m.group(1).upper()) if m else None
+            brand_from_prefix += 1 if bid else 0
         if not bid:
-            no_brand.append(sku)
+            no_brand.append(f"{sku}: brand '{text(r['brand']) or ''}' {text(r['product_name']) or ''}")
             continue
         seen.add(sku)
-        barcode = re.sub(r"\s", "", text(r["barcode"]) or "") or None
+        # '810876037013.' -> stray dot / spaces removed. '3.34613E+12' (spoilt by Excel) stays not valid -> empty
+        barcode = re.sub(r"\s", "", text(r["barcode"]) or "").rstrip(".") or None
         if barcode and not re.fullmatch(r"[0-9]{8,14}", barcode):
             bad_barcode.append(f"{sku}: {barcode}")
             barcode = None
@@ -324,12 +349,14 @@ def copy_products(cur, report, im, skipped, brand_ids):
     report["products"] = {"in_item_master": len(im) + sum(skipped.values()), "copied": len(data),
                           "not_copied": dict(skipped, no_sku=len(no_sku), duplicate_sku=len(dup_sku),
                                              brand_not_found=len(no_brand)),
-                          "examples_no_sku": example(no_sku), "examples_duplicate_sku": example(dup_sku),
-                          "examples_brand_not_found": example(no_brand),
-                          "barcode_not_8_14_digits_left_empty": len(bad_barcode),
-                          "examples_bad_barcode": example(bad_barcode),
+                          "brand_taken_from_sku_prefix": brand_from_prefix,
+                          "barcode_not_8_14_digits_left_empty": len(bad_barcode)}
+    # full lists (2026-11-26, so every product left out can be fixed in Item Master)
+    report["not_copied_details"] = {"no_sku": no_sku, "duplicate_sku": dup_sku, "brand_not_found": no_brand,
+                                    "bad_barcode_left_empty": bad_barcode}
+    report["products"].update({
                           "with_size_in_ml": sum(1 for d in data if d[7]),
-                          "with_gender": sum(1 for d in data if d[6])}
+                          "with_gender": sum(1 for d in data if d[6])})
     cur.execute("SELECT legacy_id, id FROM core.products WHERE legacy_id IS NOT NULL")
     return dict(cur.fetchall())
 
@@ -445,9 +472,9 @@ def copy_settings(cur, report):
 def copy_reference_data(cur, report):
     cur.execute("SET LOCAL TIME ZONE 'UTC'")        # old times without zone were written by Render (UTC)
     im, skipped = read_item_master(cur)
-    brand_ids = copy_brands(cur, report, im)
+    brand_ids, by_prefix = copy_brands(cur, report, im)
     copy_options(cur, report, im)
-    product_ids = copy_products(cur, report, im, skipped, brand_ids)
+    product_ids = copy_products(cur, report, im, skipped, brand_ids, by_prefix)
     copy_listings_and_stock(cur, report, im, product_ids)
     copy_rules(cur, report, product_ids)
     copy_users(cur, report)

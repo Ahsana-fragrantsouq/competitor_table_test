@@ -9,7 +9,8 @@ changed by Create a new item (Next SKU number + 1). Re-copy from Airtable only i
 Every load copies ALL brands again - safe to repeat. Next SKU number: the HIGHER of ours / Airtable's is kept
 (Create a new item raises ours when it makes a SKU - an older Airtable number never brings it back down).
 Read it with:  python sql.py "SELECT * FROM brand_sku ORDER BY brand"
-NEW brands are made on our website: Item Master -> Brands -> "Create new" (Brand name + SKU prefix, both must be NEW,
+NEW brands are made on our website: Item Master -> Brands -> "Create new" (Brand name only; the SKU prefix is made
+automatically = first 3 letters of the name in capitals, e.g. afnan -> AFN. Name and prefix must both be NEW,
 any capitals / spaces). Next SKU number starts at FIRST_SKU_NUMBER. Those rows have no airtable_id (created_by = admin).
 
 Where things are (change them here):
@@ -22,6 +23,7 @@ Where things are (change them here):
 
 import re
 import time
+import unicodedata
 
 from flask import Blueprint, request, jsonify, g
 
@@ -177,17 +179,29 @@ def _key(s):
     return " ".join((s or "").split()).lower()
 
 
+def prefix_from_name(name):
+    """SKU prefix of a NEW brand = the first 3 LETTERS of its name, in capitals ('afnan' -> AFN,
+    'Al Majed' -> ALM, 'Éclat' -> ECL). Spaces, digits and signs are skipped. '' when the name has fewer than 3 letters."""
+    plain = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode()   # É -> E
+    letters = re.sub(r"[^A-Za-z]", "", plain).upper()
+    return letters[:3] if len(letters) >= 3 else ""
+
+
 def create_brand(conn, name, prefix, user):
     """New brand in brand_sku. Returns (row dict, None) or (None, reason). Refused when:
-    - name or prefix is empty / prefix is not letters + digits
+    - name is empty / has fewer than 3 letters
     - the brand name already exists (brand_sku, or products in item_master / competitor_table) - any capitals / spaces
     - the SKU prefix already belongs to another brand, or SKUs like PREFIX1234 are already used in item_master"""
+    # TEST SITE (2026-11-26, user: "while creating new brands the prefix should be the first 3 letters of that brand
+    # (in capital letters) and also that prefix should be unique. eg: afnan -AFN"): the prefix typed on the page
+    # is no longer used - it is always made from the brand name (prefix_from_name). `prefix` is kept only so old
+    # callers still work.
     name = " ".join((name or "").split())
-    prefix = (prefix or "").strip().upper()
-    if not name or not prefix:
-        return None, "Brand name and SKU prefix are both needed"
-    if not re.fullmatch(r"[A-Z0-9]{2,10}", prefix):
-        return None, "SKU prefix: 2-10 letters / digits only (e.g. AFN)"
+    if not name:
+        return None, "Brand name is needed"
+    prefix = prefix_from_name(name)
+    if not prefix:
+        return None, "Brand name needs at least 3 letters (the SKU prefix is its first 3 letters)"
     ensure_table(conn)
     cur = conn.cursor()
     # two admins creating at the same moment -> the 2nd waits here until the 1st is saved (no table lock)
@@ -210,7 +224,8 @@ def create_brand(conn, name, prefix, user):
     if row:
         conn.rollback()
         log(f"[BRAND-SKU] Create refused: prefix {prefix} already belongs to '{row[0]}'")
-        return None, f"SKU prefix {prefix} already belongs to brand '{row[0]}'"
+        return None, (f"SKU prefix {prefix} (first 3 letters of '{name}') already belongs to brand '{row[0]}' - "
+                      f"each prefix must be unique")
     cur.execute("SELECT to_regclass('item_master') IS NOT NULL")
     if cur.fetchone()[0]:
         cur.execute("SELECT sku FROM item_master WHERE UPPER(TRIM(sku)) ~ %s LIMIT 1", (f"^{prefix}[0-9]+$",))
@@ -228,7 +243,7 @@ def create_brand(conn, name, prefix, user):
 
 @brand_sku_bp.post("/brand-sku/create")
 def brand_sku_create():
-    """Item Master -> Brands -> Create new (admins). Body: {brand, sku_prefix}."""
+    """Item Master -> Brands -> Create new (admins). Body: {brand} (sku_prefix is ignored - made from the name)."""
     if not is_admin():
         log(f"[BRAND-SKU] Create refused: {g.get('user')} is not an admin")
         return jsonify({"ok": False, "error": "admins only"}), 403
