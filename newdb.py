@@ -291,8 +291,20 @@ def completeness(r):
             bool(text(r["shopify_id"])), len(text(r["product_name"]) or ""), bool(text(r["perfume_name"])))
 
 
+def is_leftover(r):
+    """An empty leftover record: no perfume name, and the name is only brand + 'Perfume' ('Xerjoff     Perfume')."""
+    if text(r["perfume_name"]):
+        return False
+    rest = " ".join((text(r["product_name"]) or "").lower().split())
+    brand = key(r["brand"])
+    if brand and rest.startswith(brand):
+        rest = rest[len(brand):].strip()
+    return rest in ("", "perfume")
+
+
 def copy_products(cur, report, im, skipped, brand_ids, by_prefix):
     data, no_sku, no_brand, dup_sku, bad_barcode, seen = [], [], [], [], [], set()
+    temp_sku, all_skus = [], {text(r["sku"]) for r in im if text(r["sku"])}
     brand_from_prefix = 0
     for r in sorted(im, key=completeness, reverse=True):      # best record of each SKU first
         fid, sku = r["fi_record_id"], text(r["sku"])
@@ -300,8 +312,17 @@ def copy_products(cur, report, im, skipped, brand_ids, by_prefix):
             no_sku.append(f"{fid}: {text(r['product_name']) or '(no name)'}")
             continue
         if sku in seen:
-            dup_sku.append(f"{sku}: {fid} '{text(r['product_name']) or ''}' not copied (the fuller record was kept)")
-            continue
+            # 2026-11-26 (2nd test report): most "duplicates" are DIFFERENT products with the same SKU (VRS1001S = 4
+            # Versace gift sets). Leftovers with no perfume name ("Perfume", "Xerjoff Perfume") are dropped; real
+            # products are kept with a temporary SKU "VRS1001S-2" so nothing is lost -> fix the SKU in Item Master.
+            if is_leftover(r):
+                dup_sku.append(f"{sku}: {fid} '{text(r['product_name']) or ''}' not copied (empty leftover)")
+                continue
+            n = 2
+            while f"{sku}-{n}" in seen or f"{sku}-{n}" in all_skus:
+                n += 1
+            temp_sku.append(f"{sku} -> {sku}-{n}: {fid} '{text(r['product_name']) or ''}'")
+            sku = f"{sku}-{n}"
         bid = brand_ids.get(key(r["brand"]))
         if not bid and not text(r["brand"]):                   # empty brand -> brand of the SKU prefix
             m = re.match(r"([A-Za-z]{3,4})[0-9]", sku)
@@ -312,7 +333,7 @@ def copy_products(cur, report, im, skipped, brand_ids, by_prefix):
             continue
         seen.add(sku)
         # '810876037013.' -> stray dot / spaces removed. '3.34613E+12' (spoilt by Excel) stays not valid -> empty
-        barcode = re.sub(r"\s", "", text(r["barcode"]) or "").rstrip(".") or None
+        barcode = re.sub(r"\s", "", text(r["barcode"]) or "").rstrip(".`'") or None   # '6437842514046`' too
         if barcode and not re.fullmatch(r"[0-9]{8,14}", barcode):
             bad_barcode.append(f"{sku}: {barcode}")
             barcode = None
@@ -350,10 +371,12 @@ def copy_products(cur, report, im, skipped, brand_ids, by_prefix):
                           "not_copied": dict(skipped, no_sku=len(no_sku), duplicate_sku=len(dup_sku),
                                              brand_not_found=len(no_brand)),
                           "brand_taken_from_sku_prefix": brand_from_prefix,
+                          "same_sku_different_product_kept_with_temporary_sku": len(temp_sku),
                           "barcode_not_8_14_digits_left_empty": len(bad_barcode)}
     # full lists (2026-11-26, so every product left out can be fixed in Item Master)
     report["not_copied_details"] = {"no_sku": no_sku, "duplicate_sku": dup_sku, "brand_not_found": no_brand,
                                     "bad_barcode_left_empty": bad_barcode}
+    report["temporary_sku_fix_in_item_master"] = temp_sku
     report["products"].update({
                           "with_size_in_ml": sum(1 for d in data if d[7]),
                           "with_gender": sum(1 for d in data if d[6])})
