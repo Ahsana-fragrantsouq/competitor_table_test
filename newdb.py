@@ -28,6 +28,9 @@ Links (open in the browser, ?secret=RUN_SECRET):
                             everything (nothing is saved). Run this first.
   /newdb/run?secret=...     does steps 1 + 2 and SAVES them.
   /newdb/status?secret=...  result of the last test / run + how many rows each new table has.
+  /newdb-cost/test?secret=...  READS "Cost" of every product from Airtable French Inventories, shows what would be
+                               saved in core.cost_history, then undoes it. (Airtable is only read, never changed.)
+  /newdb-cost/run?secret=...   same, SAVED. Needs /newdb/run done first. Safe to repeat: only changed costs are added.
 
 SAFETY: refuses to run on the production database (french_fragrance_db). This is the test copy.
 
@@ -509,6 +512,109 @@ def copy_reference_data(cur, report):
         report["competitor_table_rows_without_product"] = cur.fetchone()[0]
 
 
+# ============================================================ SECTION 3b: Airtable Cost -> core.cost_history
+# 2026-11-26 (user: "i need to add cost from airtable. for now just keep in database later use in website").
+# French Inventories "Cost" is READ from Airtable (nothing is written to Airtable) and saved in core.cost_history,
+# source 'airtable'. Not used by any page yet. Run again later: only products whose Airtable cost CHANGED get a
+# new row (the old one stays as history), so nothing is doubled.
+# VAT: saved as WITHOUT 5% VAT (vat_included = FALSE), the design's assumption - still an open decision.
+# Same Airtable base / table as app.py BASE_ID / FI_TABLE (copied here: app.py imports this file).
+AT_BASE_ID = "app5gOqDt9aZrW5bV"
+AT_FI_TABLE = "tblL03CEHdYy1kUdQ"            # French Inventories
+COST_FIELDS = ["Cost", "Cost Price", "Unit Cost", "Purchase Cost"]   # first one found is used
+
+
+def norm_field(name):
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def read_airtable_costs(report):
+    """[(airtable record id, {field: value})] of French Inventories - READ only, all fields (field names vary)."""
+    import requests
+    token = os.environ.get("AIRTABLE_TOKEN", "")
+    if not token:
+        raise RuntimeError("AIRTABLE_TOKEN is not set in Render -> Environment, so Airtable cannot be read")
+    url = f"https://api.airtable.com/v0/{AT_BASE_ID}/{AT_FI_TABLE}"
+    out, offset = [], None
+    while True:
+        params = {"pageSize": 100}
+        if offset:
+            params["offset"] = offset
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=60)
+        if r.status_code == 429:                   # too many requests -> wait and try again
+            log("[NEWDB-COST] Airtable rate limit, waiting 30 s")
+            time.sleep(30)
+            continue
+        if not r.ok:
+            raise RuntimeError(f"Airtable read error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        out.extend((rec["id"], rec.get("fields", {})) for rec in data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            break
+        time.sleep(0.25)
+    log(f"[NEWDB-COST] Read {len(out)} French Inventories records from Airtable")
+    report["airtable_records_read"] = len(out)
+    return out
+
+
+def cost_number(v):
+    """Airtable number / lookup list / text 'AED 95.50' -> 95.5, or None (empty, 0, not a number)."""
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, str):
+        v = re.sub(r"[^0-9.]", "", v.replace(",", ""))
+    try:
+        v = round(float(v), 2)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def copy_costs(cur, report, records):
+    if not exists(cur, "core.products"):
+        raise RuntimeError("the new tables are not saved yet - open /newdb/run first")
+    seen = {}
+    for _, f in records:
+        for name in f:
+            seen.setdefault(norm_field(name), name)
+    report["airtable_fields_with_cost_in_name"] = sorted(n for k, n in seen.items() if "cost" in k)
+    field = next((seen[norm_field(c)] for c in COST_FIELDS if norm_field(c) in seen), None)
+    if not field:
+        raise RuntimeError("no cost field found in French Inventories. Fields with 'cost' in the name: "
+                           f"{report['airtable_fields_with_cost_in_name'] or 'none'} - add the right name to "
+                           "COST_FIELDS in newdb.py")
+    report["cost_field_used"] = field
+    cur.execute("SELECT airtable_id, id FROM core.products WHERE airtable_id IS NOT NULL")
+    products = dict(cur.fetchall())
+    cur.execute("""SELECT DISTINCT ON (product_id) product_id, unit_cost FROM core.cost_history
+                   WHERE source = 'airtable' ORDER BY product_id, effective_at DESC, id DESC""")
+    last = {pid: float(c) for pid, c in cur.fetchall()}
+    new, unchanged, no_cost, no_product = [], 0, 0, []
+    for rid, f in records:
+        cost = cost_number(f.get(field))
+        if cost is None:
+            no_cost += 1
+            continue
+        pid = products.get(rid)
+        if not pid:
+            no_product.append(f"{rid}: {f.get('SKU') or ''} {f.get('Product Name') or ''} cost {cost}".strip())
+            continue
+        if last.get(pid) == cost:
+            unchanged += 1
+            continue
+        new.append((pid, cost, f"Airtable French Inventories '{field}'"))
+    if new:
+        psycopg2.extras.execute_values(cur, """
+            INSERT INTO core.cost_history (product_id, unit_cost, vat_included, source, created_by, note)
+            VALUES %s""", new, template="(%s, %s, FALSE, 'airtable', 'import', %s)")
+    report["cost"] = {"records_with_cost": len(records) - no_cost, "records_without_cost": no_cost,
+                      "saved_new_or_changed": len(new), "unchanged_since_last_import": unchanged,
+                      "cost_for_product_not_in_new_tables": len(no_product),
+                      "vat": "saved as WITHOUT 5% VAT (open decision in the design)"}
+    report["cost_not_saved_details"] = no_product
+
+
 # ============================================================ SECTION 4: counts
 V2_TABLES = ["ops.users", "ops.settings", "ops.run_state", "core.brands", "core.option_values", "core.products",
              "core.product_listings", "core.stock_levels", "core.cost_history", "competitor.shops",
@@ -527,29 +633,36 @@ def counts(cur):
 
 
 # ============================================================ SECTION 5: the job (background thread)
-def job(save):
+def job(save, kind="all"):
     started = time.time()
-    report = {"mode": "RUN (saved)" if save else "TEST (nothing saved)", "database": db_name(),
+    report = {"job": "Airtable cost -> core.cost_history" if kind == "cost" else "steps 1 + 2",
+              "mode": "RUN (saved)" if save else "TEST (nothing saved)", "database": db_name(),
               "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     status.clear()
     status.update(state="running", report=report)
     conn = None
     try:
+        # Airtable is read BEFORE the database transaction opens (reading 9,600 records takes about a minute)
+        airtable = read_airtable_costs(report) if kind == "cost" else None
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
         # one run at a time across ALL website processes (the threading lock only covers one process)
         cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('newdb_job'))")
         if not cur.fetchone()[0]:
             raise RuntimeError("another /newdb run is still going - wait for it to finish")
-        apply_migrations(cur, report)                # step 1 and step 2 in ONE transaction:
-        copy_reference_data(cur, report)             # any error -> nothing at all is saved
+        if kind == "cost":
+            copy_costs(cur, report, airtable)
+        else:
+            apply_migrations(cur, report)            # step 1 and step 2 in ONE transaction:
+            copy_reference_data(cur, report)         # any error -> nothing at all is saved
         report["new_table_counts"] = counts(cur)
         if save:
             conn.commit()
             report["result"] = "SAVED"
         else:
             conn.rollback()
-            report["result"] = "TEST OK - everything undone, nothing saved. Open /newdb/run to save."
+            report["result"] = ("TEST OK - everything undone, nothing saved. Open "
+                                + ("/newdb-cost/run" if kind == "cost" else "/newdb/run") + " to save.")
         status["state"] = "done"
     except Exception as ex:
         if conn:
@@ -582,7 +695,7 @@ def save_report(report):
         log(f"[NEWDB] could not save the report: {ex}")
 
 
-def start(save):
+def start(save, kind="all"):
     if not secret_ok():
         return jsonify({"ok": False, "error": "wrong secret"}), 403
     if db_name() == PRODUCTION_DB:
@@ -591,7 +704,7 @@ def start(save):
                                               "The new tables are tried on the test copy first."}), 403
     if not lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "already running - see /newdb/status"}), 409
-    threading.Thread(target=job, args=(save,), daemon=True, name="newdb").start()
+    threading.Thread(target=job, args=(save, kind), daemon=True, name="newdb").start()
     return jsonify({"ok": True, "started": "run (saves)" if save else "test (saves nothing)",
                     "see": "/newdb/status?secret=..."})
 
@@ -606,6 +719,18 @@ def newdb_test():
 def newdb_run():
     """Steps 1 + 2, saved."""
     return start(save=True)
+
+
+@newdb_bp.route("/newdb-cost/test")
+def newdb_cost_test():
+    """Airtable Cost -> core.cost_history, then undone (nothing saved)."""
+    return start(save=False, kind="cost")
+
+
+@newdb_bp.route("/newdb-cost/run")
+def newdb_cost_run():
+    """Airtable Cost -> core.cost_history, saved."""
+    return start(save=True, kind="cost")
 
 
 @newdb_bp.route("/newdb/status")
