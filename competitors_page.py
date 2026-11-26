@@ -1900,7 +1900,11 @@ SETTINGS_HTML = """<!doctype html><html><head><title>Settings - Competitors</tit
     <label>Brand name *<input name="brand" required maxlength="100" autocomplete="off" oninput="nbPrefix(this.form)"></label>
     {# TEST SITE (2026-11-26, user: "prefix should be the first 3 letters of that brand (in capital letters) and also
        that prefix should be unique"): the prefix is made from the name (same rule as brand_sku.prefix_from_name) #}
-    <label>SKU prefix (first 3 letters)<input name="sku_prefix" readonly tabindex="-1" placeholder="AFN" title="Made automatically from the brand name"></label>
+    {# 2026-11-26, user: "change the prefix option as editable" (when the first 3 letters are already taken, e.g.
+       'afnan test' -> AFN belongs to Afnan): filled in automatically, but the admin can type another one #}
+    <label>SKU prefix *<input name="sku_prefix" required maxlength="10" pattern="[A-Za-z0-9]{2,10}" placeholder="AFN"
+           title="Filled in from the first 3 letters of the brand name - you can change it (2-10 letters / digits, must be new)"
+           autocomplete="off" oninput="this.dataset.edited = this.value ? '1' : ''"></label>
     <button type="submit" class="nbsave">Save</button>
     <button type="button" class="nbcancel" onclick="nbClose()">Cancel</button>
   </div>
@@ -1912,21 +1916,22 @@ SETTINGS_HTML = """<!doctype html><html><head><title>Settings - Competitors</tit
     var letters = (name || "").normalize("NFKD").replace(/[^A-Za-z]/g, "").toUpperCase();
     return letters.length >= 3 ? letters.slice(0, 3) : "";
   }
-  function nbPrefix(f) { f.sku_prefix.value = nbPrefixOf(f.brand.value); }
+  // fills the prefix from the name until the admin types their own prefix (empty the box = automatic again)
+  function nbPrefix(f) { if (!f.sku_prefix.dataset.edited) f.sku_prefix.value = nbPrefixOf(f.brand.value); }
   function nbOpen() {
     document.getElementById("nbform").hidden = false; document.getElementById("nbopen").hidden = true;
     document.querySelector("#nbform [name=brand]").focus();
   }
   function nbClose() {
-    var f = document.getElementById("nbform"); f.reset(); f.hidden = true;
+    var f = document.getElementById("nbform"); f.reset(); f.sku_prefix.dataset.edited = ""; f.hidden = true;
     document.getElementById("nbopen").hidden = false;
     var m = document.getElementById("nbmsg"); m.className = "nbmsg";
     m.textContent = "Both must be new: a brand name or SKU prefix that already exists is not saved.";
   }
   async function nbSave(f) {
     var m = document.getElementById("nbmsg"), b = f.querySelector(".nbsave");
-    var brand = f.brand.value.trim(), prefix = nbPrefixOf(brand);
-    if (!prefix) { m.className = "nbmsg err"; m.textContent = "Brand name needs at least 3 letters"; return; }
+    var brand = f.brand.value.trim(), prefix = f.sku_prefix.value.trim().toUpperCase() || nbPrefixOf(brand);
+    if (!prefix) { m.className = "nbmsg err"; m.textContent = "Type an SKU prefix (the brand name has fewer than 3 letters)"; return; }
     // quick check against the brands on this page (the website checks again, also brands without products)
     var dup = Array.prototype.some.call(document.querySelectorAll("#blist .brow"), function (r) {
       return r.dataset.name.replace(/\\s+/g, " ").trim() === brand.toLowerCase().replace(/\\s+/g, " ");

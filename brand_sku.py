@@ -9,8 +9,9 @@ changed by Create a new item (Next SKU number + 1). Re-copy from Airtable only i
 Every load copies ALL brands again - safe to repeat. Next SKU number: the HIGHER of ours / Airtable's is kept
 (Create a new item raises ours when it makes a SKU - an older Airtable number never brings it back down).
 Read it with:  python sql.py "SELECT * FROM brand_sku ORDER BY brand"
-NEW brands are made on our website: Item Master -> Brands -> "Create new" (Brand name only; the SKU prefix is made
-automatically = first 3 letters of the name in capitals, e.g. afnan -> AFN. Name and prefix must both be NEW,
+NEW brands are made on our website: Item Master -> Brands -> "Create new" (Brand name + SKU prefix; the prefix is
+filled in automatically = first 3 letters of the name in capitals, e.g. afnan -> AFN, and can be changed when that
+one is taken. Name and prefix must both be NEW,
 any capitals / spaces). Next SKU number starts at FIRST_SKU_NUMBER. Those rows have no airtable_id (created_by = admin).
 
 Where things are (change them here):
@@ -193,15 +194,17 @@ def create_brand(conn, name, prefix, user):
     - the brand name already exists (brand_sku, or products in item_master / competitor_table) - any capitals / spaces
     - the SKU prefix already belongs to another brand, or SKUs like PREFIX1234 are already used in item_master"""
     # TEST SITE (2026-11-26, user: "while creating new brands the prefix should be the first 3 letters of that brand
-    # (in capital letters) and also that prefix should be unique. eg: afnan -AFN"): the prefix typed on the page
-    # is no longer used - it is always made from the brand name (prefix_from_name). `prefix` is kept only so old
-    # callers still work.
+    # (in capital letters) and also that prefix should be unique. eg: afnan -AFN"): no prefix sent -> first 3 letters
+    # of the name (prefix_from_name). Then (user: "change the prefix option as editable", e.g. 'afnan test' -> AFN
+    # already belongs to Afnan): a prefix typed on the page is used instead - it must still be new.
     name = " ".join((name or "").split())
     if not name:
         return None, "Brand name is needed"
-    prefix = prefix_from_name(name)
+    prefix = (prefix or "").strip().upper() or prefix_from_name(name)
     if not prefix:
-        return None, "Brand name needs at least 3 letters (the SKU prefix is its first 3 letters)"
+        return None, "Type an SKU prefix (the brand name has fewer than 3 letters)"
+    if not re.fullmatch(r"[A-Z0-9]{2,10}", prefix):
+        return None, "SKU prefix: 2-10 letters / digits only (e.g. AFN)"
     ensure_table(conn)
     cur = conn.cursor()
     # two admins creating at the same moment -> the 2nd waits here until the 1st is saved (no table lock)
@@ -224,8 +227,8 @@ def create_brand(conn, name, prefix, user):
     if row:
         conn.rollback()
         log(f"[BRAND-SKU] Create refused: prefix {prefix} already belongs to '{row[0]}'")
-        return None, (f"SKU prefix {prefix} (first 3 letters of '{name}') already belongs to brand '{row[0]}' - "
-                      f"each prefix must be unique")
+        return None, (f"SKU prefix {prefix} already belongs to brand '{row[0]}' - each prefix must be unique, "
+                      f"type another one in the SKU prefix box")
     cur.execute("SELECT to_regclass('item_master') IS NOT NULL")
     if cur.fetchone()[0]:
         cur.execute("SELECT sku FROM item_master WHERE UPPER(TRIM(sku)) ~ %s LIMIT 1", (f"^{prefix}[0-9]+$",))
@@ -243,7 +246,7 @@ def create_brand(conn, name, prefix, user):
 
 @brand_sku_bp.post("/brand-sku/create")
 def brand_sku_create():
-    """Item Master -> Brands -> Create new (admins). Body: {brand} (sku_prefix is ignored - made from the name)."""
+    """Item Master -> Brands -> Create new (admins). Body: {brand, sku_prefix} (empty prefix = first 3 letters of the name)."""
     if not is_admin():
         log(f"[BRAND-SKU] Create refused: {g.get('user')} is not an admin")
         return jsonify({"ok": False, "error": "admins only"}), 403
