@@ -737,19 +737,33 @@ def newdb_cost_run():
 def newdb_status():
     if not secret_ok():
         return jsonify({"ok": False, "error": "wrong secret"}), 403
-    out = {"running_in_this_process": status.get("state") == "running"}
+    # 2026-11-26: the LAST report of EACH job is shown separately (a main test after the cost test hid the cost
+    # report). Long lists are shortened to counts; add &full=1 to see them.
+    full = request.args.get("full") == "1"
+    running = status.get("state") == "running"
+    out = {"running_now_in_this_process": (status.get("report") or {}).get("job") if running else None}
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
-        if exists(cur, "public.newdb_reports"):
-            cur.execute("SELECT finished_at::text, report FROM public.newdb_reports ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            if row:
-                out["state"] = "done"
-                out["finished_at"], out["report"] = row
-        if "report" not in out:
-            out["state"] = "no finished run yet" if not out["running_in_this_process"] else "running"
-            out["report"] = status.get("report")
+        for label, job_name in (("last_cost_import", "Airtable cost -> core.cost_history"),
+                                ("last_steps_1_2", "steps 1 + 2")):
+            row = None
+            if exists(cur, "public.newdb_reports"):
+                cur.execute("""SELECT finished_at::text, report FROM public.newdb_reports
+                               WHERE COALESCE(report->>'job', 'steps 1 + 2') = %s ORDER BY id DESC LIMIT 1""",
+                            (job_name,))
+                row = cur.fetchone()
+            if not row:
+                out[label] = "not run yet (or still running)"
+                continue
+            rep = dict(row[1])
+            if not full:
+                for k in ("temporary_sku_fix_in_item_master", "not_copied_details", "cost_not_saved_details"):
+                    if isinstance(rep.get(k), list):
+                        rep[k] = f"{len(rep[k])} rows (add &full=1 to see them)"
+                    elif isinstance(rep.get(k), dict):
+                        rep[k] = {a: len(b) for a, b in rep[k].items()}
+            out[label] = {"finished_at": row[0], "result": rep.get("result"), "report": rep}
         out["saved_now"] = counts(cur)
         if exists(cur, "public.newdb_migrations"):
             cur.execute("SELECT name, applied_at::text FROM public.newdb_migrations ORDER BY name")
