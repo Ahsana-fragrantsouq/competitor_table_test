@@ -68,7 +68,13 @@ API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
 TIMEOUT = 40                         # seconds per Shopify request
 SAVE_URL = "/item-master/create-in-website"
 # same price lists as Combined_codes/create_shopify_item.py (only UAE gets a price: the old flow sent only UAE Price)
-PRICE_LIST_IDS = {"UAE": "gid://shopify/PriceList/31168201019"}
+PRICE_LIST_IDS = {"UAE": "gid://shopify/PriceList/31168201019"}     # LIVE store's UAE price list
+# TEST SITE (2026-11-27, user: "when click create in website add this product in dev store not live store since this
+# is test site"): on the test site (TEST_SITE=on) the product is only created when SHOPIFY_SHOP is the DEV store,
+# and the UAE price list is looked up BY NAME in that store (the live store's fixed id above does not exist there).
+TEST_SITE = os.environ.get("TEST_SITE", "off").lower() in ("on", "1", "true", "yes")
+UAE_CATALOG = "United Arab Emirates"     # Shopify market catalog title of the UAE price list (same as item_edit.py)
+STORE_NAME = SHOP if TEST_SITE else "fragrantsouq.com"             # shown in the "Create this product on ...?" box
 CURRENCY = "AED"
 SHOPIFY_CATEGORY = "Health & Beauty > Personal Care > Cosmetics > Perfumes & Colognes"
 DEFAULT_WEIGHT_G = 850
@@ -118,7 +124,7 @@ WEB_JS = """  // ---- Create in website (admins only, shopify_create.py) ----
     return new Promise(function (done) {
       var bg = document.createElement("div");
       bg.className = "webask-bg";
-      bg.innerHTML = '<div class="webask" role="dialog"><p>Create this product on fragrantsouq.com (Shopify) now?</p>' +
+      bg.innerHTML = '<div class="webask" role="dialog"><p>Create this product on @@STORE@@ (Shopify) now?</p>' +
         '<label><input type="checkbox" class="imgs"> Perfume images uploaded</label>' +
         '<div class="btns"><button type="button" class="ok" disabled>OK</button>' +
         '<button type="button" class="no">Cancel</button></div></div>';
@@ -169,7 +175,7 @@ WEB_JS = """  // ---- Create in website (admins only, shopify_create.py) ----
     btn.disabled = false; btn.classList.remove("busy"); btn.textContent = "Create in website";
     if (again) createWeb(fi, btn, true);
   }
-""".replace("@@SAVE_URL@@", SAVE_URL)
+""".replace("@@SAVE_URL@@", SAVE_URL).replace("@@STORE@@", re.sub(r"[^A-Za-z0-9.\-]", "", STORE_NAME) or "Shopify")
 
 
 # ============================================================ SECTION 3: database (item_master)
@@ -361,6 +367,23 @@ def set_metafield(owner_id, namespace, key, value):
     return not errs, errs
 
 
+CATALOGS = """{ catalogs(first: 50, type: MARKET) { nodes { title status priceList { id } } } }"""
+
+
+def uae_price_list():
+    """Id of the UAE price list in the store we talk to (SHOPIFY_SHOP): the ACTIVE market catalog titled
+    UAE_CATALOG. Live site: the fixed PRICE_LIST_IDS id when it can't be found. Test site: None (never the live id)."""
+    try:
+        res = shopify_graphql(CATALOGS)
+        for c in ((res.get("data") or {}).get("catalogs") or {}).get("nodes") or []:
+            if c.get("title") == UAE_CATALOG and c.get("status") == "ACTIVE" and c.get("priceList"):
+                return c["priceList"]["id"]
+        log(f"[WEB-CREATE] '{UAE_CATALOG}' catalog not found in {SHOP}")
+    except Exception as ex:
+        log(f"[WEB-CREATE] could not read the Shopify catalogs: {ex}")
+    return None if TEST_SITE else PRICE_LIST_IDS["UAE"]
+
+
 # ============================================================ SECTION 5: route
 def our_link(fid):
     """competitor_table.our_link of this product (its fragrantsouq.com page), or None."""
@@ -420,6 +443,9 @@ def create_in_website():
         with run.step("Check: Shopify settings, description, product name, not on the website yet") as st:  # step 2
             if not (SHOP and TOKEN):
                 raise RuntimeError("SHOPIFY_SHOP / SHOPIFY_API_TOKEN are not set in Render -> Environment of this website")
+            if TEST_SITE and "dev" not in SHOP.lower():          # test site: never create in the LIVE store
+                raise RuntimeError(f"TEST SITE: SHOPIFY_SHOP is '{SHOP}', not the dev store - set it to the dev store "
+                                   f"(devfragrantsouq) in Render -> Environment. Nothing was created.")
             if not fields["ShopifyDesc"]:
                 raise RuntimeError("no Shopify description - create the description first")
             if not fields["Product Name"]:
@@ -495,9 +521,12 @@ def create_in_website():
 
         uae = fields["UAE Price"]
         if uae:
-            with run.step("Set the UAE price list price", input={"price_list": PRICE_LIST_IDS["UAE"],
+            uae_list = uae_price_list()
+            with run.step("Set the UAE price list price", input={"store": SHOP, "price_list": uae_list,
                                                                  "price": uae, "currency": CURRENCY}) as st:  # step 6
-                res = shopify_graphql(PRICE_ADD, {"priceListId": PRICE_LIST_IDS["UAE"], "prices": [
+                if not uae_list:
+                    raise RuntimeError(f"no active '{UAE_CATALOG}' market catalog in Shopify {SHOP}")
+                res = shopify_graphql(PRICE_ADD, {"priceListId": uae_list, "prices": [
                     {"variantId": variant_gid, "price": {"amount": str(uae), "currencyCode": CURRENCY}}]})
                 errs = ((res.get("data") or {}).get("priceListFixedPricesAdd") or {}).get("userErrors") or res.get("errors")
                 st["output"] = res
