@@ -39,6 +39,8 @@ Links (open in the browser, ?secret=RUN_SECRET):
                                Undone at the end. Default: all shops.
   /newdb-matches/run?secret=...&shops=am,vp   same, SAVED. Safe to repeat; after the first run the automatic
                                check (below) keeps the links in step too.
+  /newdb-compare/run?secret=...  step 5 check: old suggested price vs new for EVERY product, with the reason for
+                               each difference. Reads only, never changes anything. Repeat any time.
   /newdb-sync/run?secret=...   copies the shop-list rows changed since the last check, now. The website also does
                                this by itself every 15 minutes (SECTION 3d; Render env NEWDB_SYNC=off stops it).
 
@@ -1081,6 +1083,116 @@ def copy_matches(cur, report, only=None):
     report["products_with_a_valid_competitor_price_now"] = cur.fetchone()[0]
 
 
+# ============================================================ SECTION 3f: step 5 - compare old and new suggested price
+# 2026-11-27 (user: "start step 5"). Design step 5: "Compare old and new suggested prices for every product before
+# switching". Reads both, changes NOTHING. For every product that differs it says WHY, checking the shop that was
+# cheapest on the OLD table in the new tables:
+#   link not copied | shop not used for pricing | stock differs | page check failed | no price in the list |
+#   price too old (older than the shop's max_age_days) | unconfirmed link on a shop without barcodes (Ounass) |
+#   list price differs from the old table | new cheapest is another shop | same cheapest, other rule (discount,
+#   LOP / MOP, cost floor)
+EXAMPLES = 25
+
+
+def compare_prices(cur, report):
+    from db_triggers import COMPETITORS
+    if not exists(cur, "competitor.matches"):
+        raise RuntimeError("step 4 is not saved yet - open /newdb-matches/run first")
+    have = columns(cur, "competitor_table")
+    codes = [c for _, c in COMPETITORS if f"{c}_link" in have]
+    sel = ", ".join(f"{c}_link, {c}_price, {c}_stock" for c in codes)
+    cur.execute(f"SELECT fi_record_id, sku, suggested_price, {sel} FROM competitor_table")
+    old = {}
+    for row in cur.fetchall():
+        fid, sku, sug = row[:3]
+        cheap = None
+        for i, c in enumerate(codes):
+            link, price, stock = row[3 + 3 * i: 6 + 3 * i]
+            if link and stock and price is not None and float(price) > 0:
+                if cheap is None or float(price) < cheap[0]:
+                    cheap = (float(price), c)
+        old[fid] = (sku, float(sug) if sug is not None else None, cheap)
+    cur.execute("""SELECT p.legacy_id, v.suggested_price, v.cheapest_price, l.shop_code
+                     FROM pricing.v_suggested_price v
+                     JOIN core.products p ON p.id = v.product_id
+                     LEFT JOIN competitor.listings l ON l.id = v.cheapest_listing_id""")
+    new = {lid: (float(s_) if s_ is not None else None, float(c) if c is not None else None, sh)
+           for lid, s_, c, sh in cur.fetchall()}
+    cur.execute("""SELECT p.legacy_id, m.shop_code, l.price_inc_vat, l.stock_status, l.check_status,
+                          l.last_success_at >= now() - make_interval(days => s.max_age_days) AS fresh,
+                          floor(extract(epoch FROM now() - l.last_success_at) / 86400)::int AS age_days,
+                          s.max_age_days, s.has_gtin, m.confirmed, s.used_for_pricing AND s.active
+                     FROM competitor.matches m
+                     JOIN competitor.listings l ON l.id = m.listing_id
+                     JOIN competitor.shops s ON s.code = m.shop_code
+                     JOIN core.products p ON p.id = m.product_id""")
+    info = {(r[0], r[1]): r[2:] for r in cur.fetchall()}
+
+    counts_, examples, by_shop, too_old_only = {}, {}, {}, 0
+    for fid, (sku, o, cheap) in old.items():
+        if fid not in new:
+            reason = "product not in the new tables"
+            n = None
+        else:
+            n = new[fid][0]
+            if o is None and n is None:
+                reason = "same (both empty)"
+            elif o is not None and n is not None and abs(o - n) < 0.005:
+                reason = "same"
+            elif cheap is None:
+                reason = "new has a price, old has none"
+            else:
+                code = cheap[1]
+                mi = info.get((fid, code))
+                if not mi:
+                    reason = "old cheapest link not copied"
+                else:
+                    price, stock, check, fresh, age, max_age, has_gtin, confirmed, used = mi
+                    if not used:
+                        reason = "old cheapest shop not used for pricing"
+                    elif stock != "in_stock":
+                        reason = f"stock differs (list says {stock})"
+                    elif check != "ok":
+                        reason = "page check failed"
+                    elif price is None or float(price) <= 0:
+                        reason = "no price in the list"
+                    elif not fresh:
+                        reason = "price too old"
+                        too_old_only += 1
+                    elif not has_gtin and not confirmed:
+                        reason = "unconfirmed link on a shop without barcodes (Ounass)"
+                    elif abs(float(price) - cheap[0]) > 0.01:
+                        reason = "list price differs from the old table"
+                    elif new[fid][2] and new[fid][2] != code:
+                        reason = "new cheapest is another shop"
+                    else:
+                        reason = "same cheapest price, other rule (discount, LOP / MOP, cost floor)"
+                by_shop.setdefault(reason, {})
+                by_shop[reason][code] = by_shop[reason].get(code, 0) + 1
+        counts_[reason] = counts_.get(reason, 0) + 1
+        if not reason.startswith("same") and len(examples.setdefault(reason, [])) < EXAMPLES:
+            examples[reason].append(f"{sku}: old {o} -> new {n}"
+                                    + (f" (old cheapest {cheap[1]} {cheap[0]})" if cheap else ""))
+    total = sum(counts_.values())
+    same = counts_.get("same", 0) + counts_.get("same (both empty)", 0)
+    report["products_compared"] = total
+    report["same"] = same
+    report["different"] = total - same
+    report["reasons"] = dict(sorted(counts_.items(), key=lambda x: -x[1]))
+    report["reasons_by_old_cheapest_shop"] = by_shop
+    report["old_has_suggested_price"] = sum(1 for v in old.values() if v[1] is not None)
+    report["new_has_suggested_price"] = sum(1 for v in new.values() if v[0] is not None)
+    report["differences_only_because_prices_are_too_old"] = too_old_only
+    cur.execute("""SELECT s.code, s.max_age_days, max(l.last_success_at)::date::text,
+                          floor(extract(epoch FROM now() - max(l.last_success_at)) / 86400)::int
+                     FROM competitor.shops s LEFT JOIN competitor.listings l ON l.shop_code = s.code
+                    WHERE s.used_for_pricing GROUP BY s.code, s.max_age_days ORDER BY s.code""")
+    report["shop_freshness"] = {c: {"newest_price": d, "days_old": age, "limit_days": m,
+                                    "counts_now": age is not None and age <= m}
+                                for c, m, d, age in cur.fetchall()}
+    report["compare_examples"] = examples
+
+
 # ============================================================ SECTION 4: counts
 V2_TABLES = ["ops.users", "ops.settings", "ops.run_state", "core.brands", "core.option_values", "core.products",
              "core.product_listings", "core.stock_levels", "core.cost_history", "competitor.shops",
@@ -1101,7 +1213,8 @@ def counts(cur):
 # ============================================================ SECTION 5: the job (background thread)
 JOB_NAMES = {"all": "steps 1 + 2", "cost": "Airtable cost -> core.cost_history",
              "shops": "step 3: shop lists -> competitor.listings",
-             "matches": "step 4: links -> competitor.matches"}
+             "matches": "step 4: links -> competitor.matches",
+             "compare": "step 5: old vs new suggested price"}
 
 
 def job(save, kind="all", shops=None):
@@ -1127,6 +1240,8 @@ def job(save, kind="all", shops=None):
             copy_shop_lists(cur, report, shops)
         elif kind == "matches":
             copy_matches(cur, report, shops)
+        elif kind == "compare":
+            compare_prices(cur, report)
         else:
             apply_migrations(cur, report)            # step 1 and step 2 in ONE transaction:
             copy_reference_data(cur, report)         # any error -> nothing at all is saved
@@ -1137,8 +1252,9 @@ def job(save, kind="all", shops=None):
         else:
             conn.rollback()
             again = {"all": "/newdb/run", "cost": "/newdb-cost/run", "shops": "/newdb-shops/run",
-                     "matches": "/newdb-matches/run"}[kind]
-            report["result"] = f"TEST OK - everything undone, nothing saved. Open {again} to save."
+                     "matches": "/newdb-matches/run", "compare": None}[kind]
+            report["result"] = (f"TEST OK - everything undone, nothing saved. Open {again} to save." if again
+                                else "DONE - comparison only, nothing changed")
         status["state"] = "done"
     except Exception as ex:
         if conn:
@@ -1239,6 +1355,12 @@ def newdb_matches_run():
     return start(save=True, kind="matches", shops=wanted_shops())
 
 
+@newdb_bp.route("/newdb-compare/run")
+def newdb_compare_run():
+    """Step 5 check: old suggested price vs new, for every product. Reads only - nothing is ever changed."""
+    return start(save=False, kind="compare")
+
+
 @newdb_bp.route("/newdb-sync/run")
 def newdb_sync_run():
     """Copy the changed shop-list rows NOW (the same thing the automatic check does every SYNC_MINUTES)."""
@@ -1262,7 +1384,8 @@ def newdb_status():
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
-        for label, job_name in (("last_matches", JOB_NAMES["matches"]),
+        for label, job_name in (("last_compare", JOB_NAMES["compare"]),
+                                ("last_matches", JOB_NAMES["matches"]),
                                 ("last_shop_lists", JOB_NAMES["shops"]),
                                 ("last_cost_import", JOB_NAMES["cost"]),
                                 ("last_steps_1_2", JOB_NAMES["all"])):
@@ -1278,7 +1401,7 @@ def newdb_status():
             rep = dict(row[1])
             if not full:
                 for k in ("temporary_sku_fix_in_item_master", "not_copied_details", "cost_not_saved_details",
-                          "matches_details"):
+                          "matches_details", "compare_examples"):
                     if isinstance(rep.get(k), list):
                         rep[k] = f"{len(rep[k])} rows (add &full=1 to see them)"
                     elif isinstance(rep.get(k), dict):
