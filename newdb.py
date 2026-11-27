@@ -34,6 +34,8 @@ Links (open in the browser, ?secret=RUN_SECRET):
   /newdb-shops/test?secret=...&shops=am,mh   step 3: copies those shops' lists (default: all shops) into
                                competitor.listings, shows the result, then undoes it.
   /newdb-shops/run?secret=...&shops=am,mh    same, SAVED. Safe to repeat (rows updated, never doubled).
+  /newdb-sync/run?secret=...   copies the shop-list rows changed since the last check, now. The website also does
+                               this by itself every 15 minutes (SECTION 3d; Render env NEWDB_SYNC=off stops it).
 
 SAFETY: refuses to run on the production database (french_fragrance_db). This is the test copy.
 
@@ -700,7 +702,7 @@ class BrandFinder:
         return None
 
 
-def copy_shop_lists(cur, report, only=None):
+def copy_shop_lists(cur, report, only=None, since=None):
     from db_triggers import SHOP_LISTS                     # (shop, table, link column, price columns, stock column)
     cur.execute("SET LOCAL TIME ZONE 'UTC'")               # old times without zone were written by NOW() (UTC)
     if not exists(cur, "core.brands"):
@@ -733,7 +735,10 @@ def copy_shop_lists(cur, report, only=None):
                col("product_type"),
                f"COALESCE({col(size_c)}, {col('volume')})" if size_c != "volume" else col("volume"),
                col(inc_c), col(ex_c), col(stock_col), col(status_c), col("checked_at"), col("updated_at")]
-        cur.execute(f"SELECT {', '.join(sel)} FROM public.{table}")
+        if since is not None and "updated_at" in have:     # automatic sync: only rows changed since last time
+            cur.execute(f"SELECT {', '.join(sel)} FROM public.{table} WHERE updated_at > %s", (since,))
+        else:
+            cur.execute(f"SELECT {', '.join(sel)} FROM public.{table}")
         rows, seen = [], set()
         stats = {"rows_in_old_list": 0, "no_link": 0, "same_page_twice": 0, "no_price": 0,
                  "brand_found": 0, "with_barcode": 0, "with_size": 0, "price_from_ex_vat_x_1_05": 0}
@@ -809,6 +814,77 @@ def copy_shop_lists(cur, report, only=None):
         log(f"[NEWDB-SHOPS] {shop}: {len(rows)} rows -> competitor.listings ({total} now)")
     cur.execute("SELECT count(*) FROM competitor.listing_history")
     report["listing_history_rows"] = cur.fetchone()[0]
+
+
+# ============================================================ SECTION 3d: step 3 - keep competitor.listings up to date
+# 2026-11-27 (step 3, last part): every SYNC_MINUTES the website copies the shop-list rows that changed since the
+# last check (each download - PC or website - stamps its rows with updated_at). So competitor.listings follows the old
+# lists automatically, whoever downloaded the shop. Several website processes -> a database lock lets only one copy
+# at a time. Progress: ops.run_state 'newdb_shop_sync' (shown on /newdb/status).
+# Switch off: Render env NEWDB_SYNC=off.  Never runs on the production database.
+SYNC_MINUTES = 15
+SYNC_RUN_CODE = "newdb_shop_sync"
+
+
+def sync_shop_lists_once():
+    """Copy the changed rows of every shop list. Returns a short summary (or why it was skipped)."""
+    if db_name() == PRODUCTION_DB:
+        return {"skipped": "production database"}
+    conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
+    try:
+        cur = conn.cursor()
+        if not exists(cur, "competitor.listings") or not exists(cur, "ops.run_state"):
+            return {"skipped": "new tables not saved yet"}
+        cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('newdb_job'))")   # same lock as the manual jobs
+        if not cur.fetchone()[0]:
+            return {"skipped": "another /newdb job or sync is running"}
+        cur.execute("SELECT now(), (SELECT state->>'last_started' FROM ops.run_state WHERE run_code = %s)",
+                    (SYNC_RUN_CODE,))
+        now, last = cur.fetchone()
+        # first automatic run: start from the newest copy already made by hand (nothing missed, nothing redone)
+        since = last
+        if since is None:
+            cur.execute("SELECT max(updated_at)::text FROM competitor.listings")
+            since = cur.fetchone()[0]
+        cur.execute("SELECT (%s::timestamptz - interval '5 minutes')::text", (since,))   # small overlap, safe
+        since = cur.fetchone()[0]
+        report = {}
+        copy_shop_lists(cur, report, None, since)
+        changed = {k: v.get("copied") for k, v in report.get("shops", {}).items() if v.get("copied")}
+        state = {"last_started": now.isoformat(), "changed_since": since, "rows_copied": changed,
+                 "total_rows_copied": sum(changed.values())}
+        cur.execute("""INSERT INTO ops.run_state (run_code, state, updated_by) VALUES (%s, %s, 'newdb sync')
+                       ON CONFLICT (run_code) DO UPDATE SET state = EXCLUDED.state, updated_by = EXCLUDED.updated_by,
+                                                            updated_at = now()""",
+                    (SYNC_RUN_CODE, psycopg2.extras.Json(state)))
+        conn.commit()
+        if changed:
+            log(f"[NEWDB-SYNC] {state['total_rows_copied']} changed shop-list rows copied: {changed}")
+        return state
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def sync_loop():
+    time.sleep(120)                                   # let the website start first
+    while True:
+        try:
+            sync_shop_lists_once()
+        except Exception as ex:                       # never stops the website; tries again next time
+            log(f"[NEWDB-SYNC] ERROR (will try again in {SYNC_MINUTES} min): {str(ex).strip()[:300]}")
+        time.sleep(SYNC_MINUTES * 60)
+
+
+if os.environ.get("NEWDB_SYNC", "on").lower() == "off":
+    log("[NEWDB-SYNC] switched off (NEWDB_SYNC=off)")
+elif db_name() == PRODUCTION_DB:
+    log("[NEWDB-SYNC] not started: production database")
+elif os.environ.get("FF_DATABASE_URL"):
+    threading.Thread(target=sync_loop, daemon=True, name="newdb-sync").start()
+    log(f"[NEWDB-SYNC] started: changed shop-list rows -> competitor.listings every {SYNC_MINUTES} min")
 
 
 # ============================================================ SECTION 4: counts
@@ -953,6 +1029,17 @@ def newdb_shops_run():
     return start(save=True, kind="shops", shops=wanted_shops())
 
 
+@newdb_bp.route("/newdb-sync/run")
+def newdb_sync_run():
+    """Copy the changed shop-list rows NOW (the same thing the automatic check does every SYNC_MINUTES)."""
+    if not secret_ok():
+        return jsonify({"ok": False, "error": "wrong secret"}), 403
+    try:
+        return jsonify({"ok": True, "result": sync_shop_lists_once()})
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex).strip()[:500]}), 500
+
+
 @newdb_bp.route("/newdb/status")
 def newdb_status():
     if not secret_ok():
@@ -985,6 +1072,12 @@ def newdb_status():
                     elif isinstance(rep.get(k), dict):
                         rep[k] = {a: len(b) for a, b in rep[k].items()}
             out[label] = {"finished_at": row[0], "result": rep.get("result"), "report": rep}
+        if exists(cur, "ops.run_state"):
+            cur.execute("SELECT state, updated_at::text FROM ops.run_state WHERE run_code = %s", (SYNC_RUN_CODE,))
+            row = cur.fetchone()
+            out["automatic_shop_sync"] = ({"every_minutes": SYNC_MINUTES, "last": row[0], "saved_at": row[1]}
+                                          if row else f"not run yet (first check about 2 min after start, "
+                                                      f"then every {SYNC_MINUTES} min)")
         out["saved_now"] = counts(cur)
         if exists(cur, "public.newdb_migrations"):
             cur.execute("SELECT name, applied_at::text FROM public.newdb_migrations ORDER BY name")
