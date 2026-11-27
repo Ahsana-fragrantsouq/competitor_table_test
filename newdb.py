@@ -41,6 +41,8 @@ Links (open in the browser, ?secret=RUN_SECRET):
                                check (below) keeps the links in step too.
   /newdb-compare/run?secret=...  step 5 check: old suggested price vs new for EVERY product, with the reason for
                                each difference. Reads only, never changes anything. Repeat any time.
+                               &ignore_age=1 : as if every shop's prices were fresh (shows the real rule differences
+                               while the test site's shop prices are weeks old).
   /newdb-sync/run?secret=...   copies the shop-list rows changed since the last check, now. The website also does
                                this by itself every 15 minutes (SECTION 3d; Render env NEWDB_SYNC=off stops it).
 
@@ -1094,10 +1096,15 @@ def copy_matches(cur, report, only=None):
 EXAMPLES = 25
 
 
-def compare_prices(cur, report):
+def compare_prices(cur, report, ignore_age=False):
     from db_triggers import COMPETITORS
     if not exists(cur, "competitor.matches"):
         raise RuntimeError("step 4 is not saved yet - open /newdb-matches/run first")
+    # 2026-11-27: &ignore_age=1 -> every shop's price-age limit set to 10 years INSIDE this check only (the whole
+    # check is rolled back), to see the real rule differences while the test site's shop prices are weeks old
+    report["ignore_age"] = bool(ignore_age)
+    if ignore_age:
+        cur.execute("UPDATE competitor.shops SET max_age_days = 3650")
     have = columns(cur, "competitor_table")
     codes = [c for _, c in COMPETITORS if f"{c}_link" in have]
     sel = ", ".join(f"{c}_link, {c}_price, {c}_stock" for c in codes)
@@ -1241,7 +1248,7 @@ def job(save, kind="all", shops=None):
         elif kind == "matches":
             copy_matches(cur, report, shops)
         elif kind == "compare":
-            compare_prices(cur, report)
+            compare_prices(cur, report, ignore_age=bool(shops))
         else:
             apply_migrations(cur, report)            # step 1 and step 2 in ONE transaction:
             copy_reference_data(cur, report)         # any error -> nothing at all is saved
@@ -1358,7 +1365,8 @@ def newdb_matches_run():
 @newdb_bp.route("/newdb-compare/run")
 def newdb_compare_run():
     """Step 5 check: old suggested price vs new, for every product. Reads only - nothing is ever changed."""
-    return start(save=False, kind="compare")
+    # &ignore_age=1: as if every shop's prices were fresh (test site prices are weeks old) - undone at the end
+    return start(save=False, kind="compare", shops=request.args.get("ignore_age") == "1" or None)
 
 
 @newdb_bp.route("/newdb-sync/run")
