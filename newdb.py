@@ -34,6 +34,11 @@ Links (open in the browser, ?secret=RUN_SECRET):
   /newdb-shops/test?secret=...&shops=am,mh   step 3: copies those shops' lists (default: all shops) into
                                competitor.listings, shows the result, then undoes it.
   /newdb-shops/run?secret=...&shops=am,mh    same, SAVED. Safe to repeat (rows updated, never doubled).
+  /newdb-matches/test?secret=...&shops=am,vp  step 4: links of the old Competitor table -> competitor.matches
+                               (exact page + size), suggestions + rejected links -> competitor.match_suggestions.
+                               Undone at the end. Default: all shops.
+  /newdb-matches/run?secret=...&shops=am,vp   same, SAVED. Safe to repeat; after the first run the automatic
+                               check (below) keeps the links in step too.
   /newdb-sync/run?secret=...   copies the shop-list rows changed since the last check, now. The website also does
                                this by itself every 15 minutes (SECTION 3d; Render env NEWDB_SYNC=off stops it).
 
@@ -853,6 +858,14 @@ def sync_shop_lists_once():
         changed = {k: v.get("copied") for k, v in report.get("shops", {}).items() if v.get("copied")}
         state = {"last_started": now.isoformat(), "changed_since": since, "rows_copied": changed,
                  "total_rows_copied": sum(changed.values())}
+        # step 4 (2026-11-27): once the links were copied by hand (/newdb-matches/run), keep them in step too -
+        # links still change on the old Competitor table (match runs, OK / Not OK, Edit link)
+        cur.execute("SELECT EXISTS (SELECT 1 FROM competitor.matches)")
+        if cur.fetchone()[0]:
+            mrep = {}
+            copy_matches(cur, mrep, None)
+            state["links_changed"] = {k: v.get("changed") for k, v in mrep.get("shops", {}).items()
+                                      if v.get("changed")}
         cur.execute("""INSERT INTO ops.run_state (run_code, state, updated_by) VALUES (%s, %s, 'newdb sync')
                        ON CONFLICT (run_code) DO UPDATE SET state = EXCLUDED.state, updated_by = EXCLUDED.updated_by,
                                                             updated_at = now()""",
@@ -887,6 +900,187 @@ elif os.environ.get("FF_DATABASE_URL"):
     log(f"[NEWDB-SYNC] started: changed shop-list rows -> competitor.listings every {SYNC_MINUTES} min")
 
 
+# ============================================================ SECTION 3e: step 4 - links -> competitor.matches
+# 2026-11-27 (user: "start step 4"). Every link on the old Competitor table becomes ONE row in competitor.matches,
+# pointing at the EXACT row (page + size) in competitor.listings. Old table columns per shop -> new place:
+#   <shop>_link        -> competitor.matches (one per product per shop)
+#   <shop>_method      -> method: 'barcode...' barcode | 'fuzzy...' / 'confirmed' fuzzy | 'set by X' manual |
+#                         Branded Perfume / Essenzi follow French Fragrance -> 'follows'
+#   <shop>_confirmed   -> confirmed (OK clicked or link set by an admin)
+#   <shop>_suggestion  -> competitor.match_suggestions, status 'pending'
+#   <shop>_rejected    -> competitor.match_suggestions, status 'rejected' (every refused link, all sizes of it)
+# One page with several sizes: the size is chosen by 1 same barcode, 2 same size (ml), 3 same price as the old
+# table shows. Still unclear -> no link, every size goes to the OK / Not OK queue ('pending'), as the design says.
+# The old table stays the master until step 5: running this again makes the new tables follow it (links removed
+# there are removed here, rejected links are never removed). Unlinked shops (UNLINKED_SHOPS in app.py) have no links.
+def url_key(u):
+    """Same page written slightly differently: no http(s)://, no www., no trailing /, lower case."""
+    u = (u or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    u = re.sub(r"^www\.", "", u)
+    return u.rstrip("/")
+
+
+def map_method(shop, method):
+    m = (method or "").strip().lower()
+    if shop in ("bp", "es"):
+        return "follows"
+    if m.startswith("barcode"):
+        return "barcode"
+    if m.startswith("set by") or m.startswith("manual") or m.startswith("added by"):
+        return "manual"
+    return "fuzzy"                                   # fuzzy..., confirmed (a name suggestion accepted with OK)
+
+
+def choose_size(cands, product, old_price):
+    """cands: [(listing_id, size_ml, gtin, price)] on the same page. Returns (listing_id, how) or (None, 'unclear')."""
+    if len(cands) == 1:
+        return cands[0][0], "one size"
+    barcode, ml = product
+    if barcode:
+        hit = [c for c in cands if c[2] and c[2].lstrip("0") == barcode.lstrip("0")]
+        if len(hit) == 1:
+            return hit[0][0], "barcode"
+    if ml:
+        hit = [c for c in cands if c[1] and abs(float(c[1]) - float(ml)) < 0.5]
+        if len(hit) == 1:
+            return hit[0][0], "size"
+        if hit:
+            cands = hit
+    if old_price is not None:
+        hit = [c for c in cands if c[3] is not None and abs(float(c[3]) - float(old_price)) < 0.01]
+        if len(hit) == 1:
+            return hit[0][0], "price"
+    return None, "unclear"
+
+
+def copy_matches(cur, report, only=None):
+    from db_triggers import COMPETITORS                # (label, prefix) - prefix = shop code in competitor.shops
+    if not exists(cur, "competitor.listings"):
+        raise RuntimeError("the new tables are not saved yet - open /newdb/run first")
+    codes = [c for _, c in COMPETITORS]
+    unknown = sorted(set(only or []) - set(codes))
+    if unknown:
+        raise RuntimeError(f"unknown shop code(s): {unknown}. Codes: {codes}")
+    have = columns(cur, "competitor_table")
+    cur.execute("SELECT legacy_id, id, barcode, size_ml FROM core.products WHERE legacy_id IS NOT NULL")
+    products = {lid: (pid, (bc, ml)) for lid, pid, bc, ml in cur.fetchall()}
+    report["shops"], details = {}, {}
+    for shop in [c for c in codes if only is None or c in only]:
+        r = report["shops"][shop] = {}
+        if f"{shop}_link" not in have:
+            r["result"] = "skipped: no link column in competitor_table"
+            continue
+        # this shop's listings: by exact link and by a forgiving link key
+        cur.execute("""SELECT id, url, size_ml, gtin, price_inc_vat FROM competitor.listings
+                       WHERE shop_code = %s""", (shop,))
+        by_url, by_key = {}, {}
+        for lid, url, ml, gt, price in cur.fetchall():
+            by_url.setdefault(url, []).append((lid, ml, gt, price))
+            by_key.setdefault(url_key(url), []).append((lid, ml, gt, price))
+
+        def find(link):
+            return by_url.get(link) or by_key.get(url_key(link)) or []
+
+        def col(c):
+            return f"{shop}_{c}" if f"{shop}_{c}" in have else "NULL"
+        cur.execute(f"""SELECT fi_record_id, {shop}_link, {col('method')}, {col('score')}, {col('confirmed')},
+                               {col('price')}, {col('suggestion')}, {col('rejected')} FROM competitor_table""")
+        new_matches, pending, rejected = {}, set(), set()
+        st = {"links_in_old_table": 0, "linked": 0, "size_chosen_by": {}, "unclear_size_sent_to_ok_queue": 0,
+              "link_not_in_shop_list": 0, "product_not_in_new_tables": 0, "suggestions_pending": 0,
+              "rejected_links": 0}
+        missing, unclear = [], []
+        for fid, link, method, score, confirmed, old_price, suggestion, rej in cur.fetchall():
+            link, suggestion = text(link), text(suggestion)
+            if not (link or suggestion or text(rej)):
+                continue
+            if fid not in products:
+                st["product_not_in_new_tables"] += 1
+                continue
+            pid, prod = products[fid]
+            if link:
+                st["links_in_old_table"] += 1
+                cands = find(link)
+                if not cands:
+                    st["link_not_in_shop_list"] += 1
+                    missing.append(f"{fid}: {link}")
+                else:
+                    lid, how = choose_size(cands, prod, old_price)
+                    if lid:
+                        st["linked"] += 1
+                        st["size_chosen_by"][how] = st["size_chosen_by"].get(how, 0) + 1
+                        sc = float(score) if score is not None and 0 <= float(score) <= 1 else None
+                        new_matches[pid] = (lid, map_method(shop, method), sc, bool(confirmed),
+                                            text(method)[7:].strip() if (text(method) or "").lower().startswith("set by") else None)
+                    else:
+                        st["unclear_size_sent_to_ok_queue"] += 1
+                        unclear.append(f"{fid}: {link} ({len(cands)} sizes)")
+                        pending.update((pid, c[0]) for c in cands)
+            if suggestion:
+                cands = find(suggestion)
+                lid, _ = choose_size(cands, prod, None) if cands else (None, "")
+                pending.update([(pid, lid)] if lid else [(pid, c[0]) for c in cands])
+            for u in (rej or "").split("\n"):
+                if text(u):
+                    rejected.update((pid, c[0]) for c in find(text(u)))
+        pending -= rejected                              # refused once -> never suggested again
+        pending -= {(pid, m[0]) for pid, m in new_matches.items()}
+        st["suggestions_pending"], st["rejected_links"] = len(pending), len(rejected)
+
+        # make competitor.matches follow the old table (only rows that changed are written)
+        cur.execute("SELECT product_id, listing_id, method, confirmed FROM competitor.matches WHERE shop_code = %s",
+                    (shop,))
+        old = {pid: (lid, m, c) for pid, lid, m, c in cur.fetchall()}
+        gone = [pid for pid in old if pid not in new_matches]
+        if gone:
+            cur.execute("DELETE FROM competitor.matches WHERE shop_code = %s AND product_id = ANY(%s)", (shop, gone))
+        upd = [(pid, shop, lid, m, sc, c, by) for pid, (lid, m, sc, c, by) in new_matches.items()
+               if old.get(pid) != (lid, m, c)]
+        for i in range(0, len(upd), 1000):
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO competitor.matches (product_id, shop_code, listing_id, method, score, confirmed, matched_by)
+                VALUES %s
+                ON CONFLICT (product_id, shop_code) DO UPDATE SET listing_id = EXCLUDED.listing_id,
+                  method = EXCLUDED.method, score = EXCLUDED.score, confirmed = EXCLUDED.confirmed,
+                  matched_by = EXCLUDED.matched_by, matched_at = now()""", upd[i:i + 1000])
+        # suggestions: rejected kept for ever; pending follows the old table
+        if rejected:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO competitor.match_suggestions (product_id, listing_id, shop_code, method, status,
+                                                          decided_by, decided_at)
+                VALUES %s
+                ON CONFLICT (product_id, listing_id) DO UPDATE SET status = 'rejected'
+                WHERE competitor.match_suggestions.status <> 'rejected'""",
+                [(a, b, shop) for a, b in rejected], template="(%s, %s, %s, 'imported', 'rejected', 'import', now())")
+        cur.execute("""SELECT product_id, listing_id FROM competitor.match_suggestions
+                       WHERE shop_code = %s AND status = 'pending'""", (shop,))
+        old_pending = set(cur.fetchall())
+        stale = list(old_pending - pending)
+        if stale:
+            psycopg2.extras.execute_values(cur, """
+                DELETE FROM competitor.match_suggestions s USING (VALUES %s) AS v(p, l)
+                WHERE s.product_id = v.p AND s.listing_id = v.l AND s.status = 'pending'""", stale)
+        add = list(pending - old_pending)
+        if add:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO competitor.match_suggestions (product_id, listing_id, shop_code, method, status)
+                VALUES %s ON CONFLICT (product_id, listing_id) DO NOTHING""",
+                [(a, b, shop) for a, b in add], template="(%s, %s, %s, 'imported', 'pending')")
+        st["changed"] = len(gone) + len(upd) + len(stale) + len(add)
+        st["result"] = "ok"
+        r.update(st)
+        details[shop] = {"link_not_in_shop_list": missing, "unclear_size": unclear}
+        log(f"[NEWDB-MATCHES] {shop}: {st['linked']} linked, {st['suggestions_pending']} pending, "
+            f"{st['rejected_links']} rejected, {st['changed']} rows changed")
+    report["matches_details"] = details
+    cur.execute("SELECT count(*), count(*) FILTER (WHERE confirmed) FROM competitor.matches")
+    report["matches_total"], report["matches_confirmed"] = cur.fetchone()
+    # how many products now get a price from the new tables (fresh, in stock, matched)
+    cur.execute("SELECT count(DISTINCT product_id) FROM competitor.v_valid_prices")
+    report["products_with_a_valid_competitor_price_now"] = cur.fetchone()[0]
+
+
 # ============================================================ SECTION 4: counts
 V2_TABLES = ["ops.users", "ops.settings", "ops.run_state", "core.brands", "core.option_values", "core.products",
              "core.product_listings", "core.stock_levels", "core.cost_history", "competitor.shops",
@@ -906,7 +1100,8 @@ def counts(cur):
 
 # ============================================================ SECTION 5: the job (background thread)
 JOB_NAMES = {"all": "steps 1 + 2", "cost": "Airtable cost -> core.cost_history",
-             "shops": "step 3: shop lists -> competitor.listings"}
+             "shops": "step 3: shop lists -> competitor.listings",
+             "matches": "step 4: links -> competitor.matches"}
 
 
 def job(save, kind="all", shops=None):
@@ -930,6 +1125,8 @@ def job(save, kind="all", shops=None):
             copy_costs(cur, report, airtable)
         elif kind == "shops":
             copy_shop_lists(cur, report, shops)
+        elif kind == "matches":
+            copy_matches(cur, report, shops)
         else:
             apply_migrations(cur, report)            # step 1 and step 2 in ONE transaction:
             copy_reference_data(cur, report)         # any error -> nothing at all is saved
@@ -939,7 +1136,8 @@ def job(save, kind="all", shops=None):
             report["result"] = "SAVED"
         else:
             conn.rollback()
-            again = {"all": "/newdb/run", "cost": "/newdb-cost/run", "shops": "/newdb-shops/run"}[kind]
+            again = {"all": "/newdb/run", "cost": "/newdb-cost/run", "shops": "/newdb-shops/run",
+                     "matches": "/newdb-matches/run"}[kind]
             report["result"] = f"TEST OK - everything undone, nothing saved. Open {again} to save."
         status["state"] = "done"
     except Exception as ex:
@@ -1029,6 +1227,18 @@ def newdb_shops_run():
     return start(save=True, kind="shops", shops=wanted_shops())
 
 
+@newdb_bp.route("/newdb-matches/test")
+def newdb_matches_test():
+    """Step 4: competitor_table links -> competitor.matches / match_suggestions, then undone. ?shops=am,vp"""
+    return start(save=False, kind="matches", shops=wanted_shops())
+
+
+@newdb_bp.route("/newdb-matches/run")
+def newdb_matches_run():
+    """Step 4, saved. ?shops=am,vp (default: all shops)."""
+    return start(save=True, kind="matches", shops=wanted_shops())
+
+
 @newdb_bp.route("/newdb-sync/run")
 def newdb_sync_run():
     """Copy the changed shop-list rows NOW (the same thing the automatic check does every SYNC_MINUTES)."""
@@ -1052,7 +1262,8 @@ def newdb_status():
     try:
         conn = psycopg2.connect(os.environ["FF_DATABASE_URL"], sslmode="require")
         cur = conn.cursor()
-        for label, job_name in (("last_shop_lists", JOB_NAMES["shops"]),
+        for label, job_name in (("last_matches", JOB_NAMES["matches"]),
+                                ("last_shop_lists", JOB_NAMES["shops"]),
                                 ("last_cost_import", JOB_NAMES["cost"]),
                                 ("last_steps_1_2", JOB_NAMES["all"])):
             row = None
@@ -1066,11 +1277,13 @@ def newdb_status():
                 continue
             rep = dict(row[1])
             if not full:
-                for k in ("temporary_sku_fix_in_item_master", "not_copied_details", "cost_not_saved_details"):
+                for k in ("temporary_sku_fix_in_item_master", "not_copied_details", "cost_not_saved_details",
+                          "matches_details"):
                     if isinstance(rep.get(k), list):
                         rep[k] = f"{len(rep[k])} rows (add &full=1 to see them)"
                     elif isinstance(rep.get(k), dict):
-                        rep[k] = {a: len(b) for a, b in rep[k].items()}
+                        rep[k] = {a: ({x: len(y) for x, y in b.items()} if isinstance(b, dict) else len(b))
+                                  for a, b in rep[k].items()}
             out[label] = {"finished_at": row[0], "result": rep.get("result"), "report": rep}
         if exists(cur, "ops.run_state"):
             cur.execute("SELECT state, updated_at::text FROM ops.run_state WHERE run_code = %s", (SYNC_RUN_CODE,))
